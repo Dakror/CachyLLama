@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
     server-context-ssd-cache.h
     server-tools.cpp
     server-tools.h
+    server-mcp.cpp
+    server-mcp.h
     server-schema.cpp
     server-schema.h
 )
