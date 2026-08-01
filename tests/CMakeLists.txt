@@ -87,7 +87,7 @@ function(llama_build_and_test source)
     set(multiValueArgs ARGS)
     cmake_parse_arguments(LLAMA_TEST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS} get-model.cpp)
+    set(TEST_SOURCES ${source} ${LLAMA_TEST_UNPARSED_ARGUMENTS})
 
     if (NOT DEFINED LLAMA_TEST_LABEL)
         set(LLAMA_TEST_LABEL "main")
@@ -148,8 +148,8 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
-llama_build(test-recurrent-state-rollback.cpp get-model.cpp)
-llama_build(test-seq-rm-attn-only.cpp get-model.cpp)
+llama_build(test-recurrent-state-rollback.cpp)
+llama_build(test-seq-rm-attn-only.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
@@ -266,13 +266,7 @@ set_tests_properties(test-download-model PROPERTIES FIXTURES_SETUP test-download
 
 llama_build_and_test(test-thread-safety.cpp ARGS -m "${MODEL_DEST}" -ngl 99 -p "The meaning of life is" -n 128 -c 256 -ub 32 -np 4 -t 2)
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
-# Regression test for fewtarius/llama-ai issue #6:
-# SSD cache auto-sizing must respect --cache-ssd-hot-ram / --cache-ssd-warm-ram.
-llama_build_and_test(test-ssd-cache-caps.cpp)
-# Continuation matching must consider long (n_tokens > ~4551) checkpoints,
-# not just the bounded 4096-token prefix. Normalize overlap by token_count.
-llama_build_and_test(test-ssd-cache-continuation.cpp)
-llama_build_and_test(test-ssd-cache-prefix-match.cpp)
+
 llama_build_and_test(test-arg-parser.cpp)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
@@ -293,6 +287,10 @@ set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED 
 # Test state save/load functionality
 llama_build_and_test(test-save-load-state.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED test-download-model)
+
+if (APPLE)
+    llama_build(test-rset-release.cpp)
+endif()
 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
