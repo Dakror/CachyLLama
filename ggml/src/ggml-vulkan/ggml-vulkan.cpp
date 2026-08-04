@@ -773,6 +773,7 @@ struct vk_device_struct {
     bool dsv4_hc_comb;
     bool dsv4_hc_pre;
     bool dsv4_hc_post;
+    bool lightning_indexer;
     bool shader_int64;
     bool buffer_device_address;
     bool vulkan_memory_model;
@@ -1002,6 +1003,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_comb_f32;
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
+    vk_pipeline pipeline_lightning_indexer_f32;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1356,6 +1358,29 @@ struct vk_op_dsv4_hc_post_push_constants {
     uint32_t p_offset;
     uint32_t c_offset;
     uint32_t d_offset;
+};
+
+struct vk_op_lightning_indexer_push_constants {
+    uint32_t n_embd;
+    uint32_t n_head;
+    uint32_t n_batch;
+    uint32_t n_stream;
+    uint32_t n_kv;
+    uint32_t nem3;
+
+    uint32_t nbq1; uint32_t nbq2; uint32_t nbq3;
+    uint32_t nbk2; uint32_t nbk3;
+    uint32_t nbw1; uint32_t nbw3;
+    uint32_t nbm1; uint32_t nbm3;
+    uint32_t nbd1; uint32_t nbd3;
+
+    uint32_t q_offset;
+    uint32_t k_offset;
+    uint32_t w_offset;
+    uint32_t m_offset;
+    uint32_t d_offset;
+
+    uint32_t k_type_id;
 };
 
 struct vk_op_count_experts_push_constants {
@@ -2439,6 +2464,16 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     p.p_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
     p.c_offset = get_misalign_bytes(ctx, src3) / ggml_type_size(src3->type);
     p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+}
+
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_lightning_indexer_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    p.q_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.k_offset = get_misalign_bytes(ctx, src1) / ggml_type_size(src1->type);
+    p.w_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
+    p.m_offset = get_misalign_bytes(ctx, src3) / ggml_type_size(src3->type);
+    p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
+
+    p.k_type_id = (uint32_t) src1->type;
 }
 
 struct ggml_backend_vk_buffer_context {
@@ -5707,6 +5742,16 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32,  "dsv4_hc_pre_f32",  dsv4_hc_pre_f32_len,  dsv4_hc_pre_f32_data,  "main", 3, sizeof(vk_op_dsv4_hc_pre_push_constants),  {256, 1, 1}, { 256 }, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32, "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_post_push_constants), {256, 1, 1}, { 256 }, 1);
 
+    // DeepSeek-V4 Lightning Indexer: requires subgroups for the per-head dot
+    // product reduction. The shader is parameterised on N_EMBD/N_HEAD via
+    // specialization constants; the workgroup size is fixed at 32x4.
+    if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_f32,
+            "lightning_indexer_f32", lightning_indexer_f32_len, lightning_indexer_f32_data,
+            "main", 5, sizeof(vk_op_lightning_indexer_push_constants),
+            { 1, 1, 1 }, { 32, 4, 1 }, 1, true, true, device->subgroup_size);
+    }
+
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
 
@@ -6622,11 +6667,6 @@ static vk_device ggml_vk_get_device(size_t idx) {
                             device->properties.limits.maxPushConstantsSize >= sizeof(vk_op_multi_add_push_constants) &&
                             getenv("GGML_VK_DISABLE_MULTI_ADD") == nullptr;
 
-        const bool dsv4_hc_all = getenv("GGML_VK_DISABLE_DSV4_HC") == nullptr;
-        device->dsv4_hc_comb = dsv4_hc_all && getenv("GGML_VK_DISABLE_DSV4_HC_COMB") == nullptr;
-        device->dsv4_hc_pre  = dsv4_hc_all && getenv("GGML_VK_DISABLE_DSV4_HC_PRE")  == nullptr;
-        device->dsv4_hc_post = dsv4_hc_all && getenv("GGML_VK_DISABLE_DSV4_HC_POST") == nullptr;
-
         device->shader_int64 = device_features2.features.shaderInt64;
         device->buffer_device_address = vk12_features.bufferDeviceAddress;
         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
@@ -6642,6 +6682,18 @@ static vk_device ggml_vk_get_device(size_t idx) {
                 subgroup_size_control_features.subgroupSizeControl;
 
         device->subgroup_require_full_support = subgroup_size_control_features.computeFullSubgroups;
+
+        // Compute subgroup-gated feature flags now that subgroup_require_full_support
+        // has been finalised. Previously these were assigned earlier (before the
+        // computeFullSubgroups probe) and would always evaluate to false on devices
+        // that enable subgroup_size_control.
+        const bool dsv4_hc_all = getenv("GGML_VK_DISABLE_DSV4_HC") == nullptr;
+        device->dsv4_hc_comb = dsv4_hc_all && getenv("GGML_VK_DISABLE_DSV4_HC_COMB") == nullptr;
+        device->dsv4_hc_pre  = dsv4_hc_all && getenv("GGML_VK_DISABLE_DSV4_HC_PRE")  == nullptr;
+        device->dsv4_hc_post = dsv4_hc_all && getenv("GGML_VK_DISABLE_DSV4_HC_POST") == nullptr;
+
+        device->lightning_indexer = getenv("GGML_VK_DISABLE_LIGHTNING_INDEXER") == nullptr &&
+                                    device->subgroup_arithmetic && device->subgroup_require_full_support;
 
 #if defined(VK_KHR_cooperative_matrix)
         device->coopmat_support = device->coopmat_support && coopmat_features.cooperativeMatrix;
@@ -10053,6 +10105,47 @@ static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subc
     init_pushconst_tensor_offsets(ctx, pc, x, residual, post, comb, dst);
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, r_buf, p_buf, c_buf, d_buf }, pc, { n_embd, n_tokens, 1 });
+}
+
+static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * w, const ggml_tensor * mask, ggml_tensor * dst) {
+    VK_LOG_DEBUG("ggml_vk_lightning_indexer(" << q << ", " << k << ", " << w << ", " << mask << ", " << dst << ")");
+
+    vk_pipeline pipeline = ctx->device->pipeline_lightning_indexer_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q,    true);
+    const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k,    true);
+    const vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, w,    true);
+    const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mask, true);
+    const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,  true);
+
+    const uint32_t n_embd      = (uint32_t) q->ne[0];
+    const uint32_t n_head      = (uint32_t) q->ne[1];
+    const uint32_t n_batch     = (uint32_t) q->ne[2];
+    const uint32_t n_stream    = (uint32_t) q->ne[3];
+    const uint32_t n_kv        = (uint32_t) k->ne[2];
+    const uint32_t nem3        = (uint32_t) mask->ne[3];
+
+    vk_op_lightning_indexer_push_constants pc = {
+        n_embd, n_head, n_batch, n_stream, n_kv, nem3,
+        ggml_vk_nb_elem(q, 1), ggml_vk_nb_elem(q, 2), ggml_vk_nb_elem(q, 3),
+        ggml_vk_nb_elem(k, 2), ggml_vk_nb_elem(k, 3),
+        ggml_vk_nb_elem(w, 1), ggml_vk_nb_elem(w, 3),
+        ggml_vk_nb_elem(mask, 1), ggml_vk_nb_elem(mask, 3),
+        ggml_vk_nb_elem(dst, 1), ggml_vk_nb_elem(dst, 3),
+        0, 0, 0, 0, 0,
+        (uint32_t) k->type,
+    };
+    init_pushconst_tensor_offsets(ctx, pc, q, k, w, mask, dst);
+
+    // Workgroup geometry: dispatch ceil(n_kv / K_VECS_PER_BLOCK) groups in x,
+    // one group per (batch, stream) in y/z. n_kv limited by maxComputeWorkGroupCount[0].
+    const uint32_t kv_per_block = 32u;
+    const uint32_t groups_x = (n_kv + kv_per_block - 1u) / kv_per_block;
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, w_buf, m_buf, d_buf }, pc,
+        { groups_x, n_batch, n_stream });
 }
 
 static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -15714,6 +15807,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_dsv4_hc_post(ctx, compute_ctx, src0, src1, src2, src3, node);
 
         break;
+    case GGML_OP_LIGHTNING_INDEXER:
+        ggml_vk_lightning_indexer(ctx, compute_ctx, src0, src1, src2, src3, node);
+
+        break;
     case GGML_OP_MEAN:
         ggml_vk_mean(ctx, compute_ctx, src0, node);
 
@@ -18471,6 +18568,41 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // pre/post launch one workgroup row per token
                 const uint32_t n_tokens = (uint32_t)(op->op == GGML_OP_DSV4_HC_PRE ? op->src[0]->ne[2] : op->src[0]->ne[1]);
                 return n_tokens <= device->properties.limits.maxComputeWorkGroupCount[1];
+            }
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                if (!device->lightning_indexer || op->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // Q: [n_embd, n_head, n_batch, n_stream]
+                if (op->src[0]->type != GGML_TYPE_F32) {
+                    return false;
+                }
+                // K: any of the supported quantized types
+                switch (op->src[1]->type) {
+                    case GGML_TYPE_F32:
+                    case GGML_TYPE_F16:
+                    case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_1:
+                    case GGML_TYPE_Q5_0:
+                    case GGML_TYPE_Q5_1:
+                    case GGML_TYPE_Q8_0:
+                    case GGML_TYPE_IQ4_NL:
+                        break;
+                    default:
+                        return false;
+                }
+                // W and M are scalar/lookup tables, must match the schema
+                if (op->src[2]->type != GGML_TYPE_F32) return false;
+                if (op->src[3]->type != GGML_TYPE_F16) return false;
+                // Shader is hardcoded for N_EMBD=128 (== 32 lanes * 4 elems).
+                // The CUDA path also gates on 128 (see ggml-cuda/lightning-indexer.cu).
+                if (op->src[0]->ne[0] != 128) return false;
+                // N_HEAD is parameterized via specialization, but for the
+                // initial port we restrict to the head counts the CUDA vec
+                // kernel supports: 32, 64. Anything else falls back to CPU.
+                if (op->src[0]->ne[1] != 32 && op->src[0]->ne[1] != 64) return false;
+                return device->pipeline_lightning_indexer_f32 != nullptr;
             }
         case GGML_OP_SOLVE_TRI:
             {
