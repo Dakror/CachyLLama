@@ -100,6 +100,13 @@ float load_k_element(uint i_kv, uint i_stream, uint j) {
         const uint lo = uint(data_k[byte_base + j * 2u]);
         const uint hi = uint(data_k[byte_base + j * 2u + 1u]);
         return float(unpackHalf2x16(lo | (hi << 8u)).x);
+    } else if (p.k_type_id == 30u) { // GGML_TYPE_BF16
+        // BF16 is the upper 16 bits of IEEE-754 float32. Read 2 bytes,
+        // build a uint16, shift into the high half of a uint32, then
+        // reinterpret as float. No extension required.
+        const uint lo = uint(data_k[byte_base + j * 2u]);
+        const uint hi = uint(data_k[byte_base + j * 2u + 1u]);
+        return uintBitsToFloat((lo | (hi << 8u)) << 16u);
     } else if (p.k_type_id == 2u) { // GGML_TYPE_Q4_0
         // block_q4_0 = {float16_t d; uint8_t qs[16];} -> 18 bytes packed.
         // Read scalar fields directly without pointer casting (glslang rejects
