@@ -5529,6 +5529,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q8_0], "dequant_q8_0", dequant_q8_0_len, dequant_q8_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     // Fused dequant+transpose for FA quant-KV scratch (only q8_0 ships the shader today).
     ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_Q8_0], "dequant_q8_0_transpose", dequant_q8_0_transpose_len, dequant_q8_0_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
+    // Strided-copy counterpart for FA f16 KV (contiguize pass). GGML_VK_FA_KV_CONTIG gates it.
+    ggml_vk_create_pipeline(device, device->pipeline_dequant_transpose[GGML_TYPE_F16], "dequant_f16_transpose", dequant_f16_transpose_len, dequant_f16_transpose_data, "main", 2, 5 * sizeof(uint32_t), {256 * 8, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q2_K], "dequant_q2_k", dequant_q2_k_len, dequant_q2_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ2_0], "dequant_tq2_0", dequant_tq2_0_len, dequant_tq2_0_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_Q3_K], "dequant_q3_k", dequant_q3_k_len, dequant_q3_k_data, "main", 2, 5 * sizeof(uint32_t), {256 * 64, 1, 1}, {}, 1);
@@ -11236,8 +11238,20 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // (GGML_VK_FA_SCRATCH_FORCE).
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
+    // EXPERIMENT (GGML_VK_FA_KV_CONTIG=1): the same contiguize pass for f16 K/V. The
+    // KV-cache view reaching FA is head-interleaved ([HS, NH, KV] physically), and the
+    // cm1 direct-from-global coopMatLoads run ~2-5x slower on those strided rows than
+    // on per-head-contiguous K/V. dequant_f16_transpose.comp is a pure strided copy.
+    // Engages only when the rows are actually strided, prefill only (N >= 64).
+    static const char * fa_kv_contig_env = getenv("GGML_VK_FA_KV_CONTIG");
+    const bool fa_kv_contig = !(fa_kv_contig_env && fa_kv_contig_env[0] == '0');
+    const bool kv_f16_strided = k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+                                N >= 64 &&
+                                (k->nb[1] != (uint64_t)HSK * sizeof(ggml_fp16_t) ||
+                                 v->nb[1] != (uint64_t)HSV * sizeof(ggml_fp16_t)) &&
+                                (HSK % 8) == 0 && (HSV % 8) == 0;
     bool use_dequant_kv = !ctx->device->fa_no_scratch_transpose &&
-                          k_quant && v_quant && N >= 64 &&
+                          ((k_quant && v_quant) || (fa_kv_contig && kv_f16_strided)) && N >= 64 &&
                           k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
                           k->nb[1] >= k->nb[2] && v->nb[1] >= v->nb[2] &&
                           ggml_is_contiguously_allocated(k) && ggml_is_contiguously_allocated(v) &&
