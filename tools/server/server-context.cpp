@@ -42,19 +42,18 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-static uint32_t server_n_outputs_max(const common_params & params) {
-    const uint32_t n_batch  = params.n_batch;
-
+static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
-        return n_batch;
+        return { params.n_batch, 1 };
     }
 
-    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
+    auto result = common_speculative_get_output_limits(
+            params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
 
-    const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
-
-    return std::max<uint32_t>(1, std::min<uint64_t>(n_batch, n_outputs));
+    result.total   = std::max<int32_t>(1, result.total);
+    result.per_seq = std::max<int32_t>(1, result.per_seq);
+    return result;
 }
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -367,12 +366,7 @@ struct server_slot {
 
     bool need_embd() const {
         GGML_ASSERT(task);
-        return task->need_embd() || (spec && common_speculative_need_embd(spec));
-    }
-
-    bool need_embd_nextn() const {
-        GGML_ASSERT(task);
-        return spec && common_speculative_need_embd_nextn(spec);
+        return task->need_embd();
     }
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
@@ -808,6 +802,11 @@ struct server_metrics {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    uint64_t n_draft_tokens_total      = 0;
+    uint64_t n_draft_accepted_total    = 0;
+    uint64_t n_draft_verif_steps_total = 0;
+    std::vector<uint64_t> n_accepted_per_pos_total;
+
     void init() {
         t_start = ggml_time_us();
     }
@@ -826,6 +825,17 @@ struct server_metrics {
         n_tokens_predicted         += slot.n_decoded;
         t_tokens_generation        += slot.t_token_generation;
         t_tokens_generation_total  += slot.t_token_generation;
+
+        n_draft_tokens_total      += slot.n_draft_total;
+        n_draft_accepted_total    += slot.n_draft_accepted;
+        n_draft_verif_steps_total += slot.n_draft_verif_steps;
+
+        if (n_accepted_per_pos_total.size() < slot.n_accepted_per_pos.size()) {
+            n_accepted_per_pos_total.resize(slot.n_accepted_per_pos.size(), 0);
+        }
+        for (size_t i = 0; i < slot.n_accepted_per_pos.size(); i++) {
+            n_accepted_per_pos_total[i] += slot.n_accepted_per_pos[i];
+        }
     }
 
     void on_decoded(const std::vector<server_slot> & slots) {
@@ -1032,7 +1042,9 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
-        params_base.n_outputs_max = server_n_outputs_max(params_base);
+        const auto output_limits = server_output_limits(params_base);
+        params_base.n_outputs_max = output_limits.total;
+        params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -2025,18 +2037,13 @@ private:
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
-            bool backend_sampling = true;
-
-            backend_sampling &= task.params.sampling.backend_sampling;
-
-            // TODO: speculative decoding requires multiple samples per batch - not supported yet
-            backend_sampling &= !(slot.can_speculate());
+            bool use_backend_sampling = task.params.sampling.backend_sampling;
 
             // TODO: getting pre sampling logits is not yet supported with backend sampling
-            backend_sampling &= !need_pre_sample_logits;
+            use_backend_sampling &= !need_pre_sample_logits;
 
             // TODO: tmp until backend sampling is fully implemented
-            if (backend_sampling) {
+            if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
@@ -2283,18 +2290,6 @@ private:
         res->n_ctx           = n_ctx;
 
         queue_results.send(std::move(res));
-    }
-
-    // Gate slot save/restore/erase on slot content (does it hold media),
-    // not model capability: a multimodal model may hold a pure-text slot.
-    bool check_slot_no_media(const server_slot & slot, const int id_task) {
-        if (slot.prompt.tokens.has_media()) {
-            send_error(id_task,
-                "This operation is not supported while the slot holds image/audio tokens (a pure-text prefix is supported)",
-                ERROR_TYPE_NOT_SUPPORTED);
-            return false;
-        }
-        return true;
     }
 
     void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
@@ -3020,6 +3015,11 @@ private:
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
 
+                    res->n_draft_tokens_total      = metrics.n_draft_tokens_total;
+                    res->n_draft_accepted_total    = metrics.n_draft_accepted_total;
+                    res->n_draft_verif_steps_total = metrics.n_draft_verif_steps_total;
+                    res->n_accepted_per_pos_total  = metrics.n_accepted_per_pos_total;
+
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
                     }
@@ -3031,9 +3031,6 @@ private:
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    if (!check_slot_no_media(*slot, task.id)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -3048,9 +3045,22 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    const llama_tokens tokens = slot->prompt.tokens.get_text_tokens();
-                    const size_t token_count = tokens.size();
-                    const size_t nwrite = llama_state_seq_save_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), token_count);
+                    std::vector<char> packed;
+                    try {
+                        packed = slot->prompt.tokens.serialize();
+                    } catch (const std::exception & err) {
+                        send_error(task, err.what(), ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+                    const size_t nwrite = llama_state_seq_save_file(
+                        ctx_tgt, filepath.c_str(), slot->id,
+                        reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+                    if (nwrite == 0) {
+                        send_error(task, "Unable to save slot", ERROR_TYPE_SERVER);
+                        break;
+                    }
 
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
@@ -3070,7 +3080,7 @@ private:
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = true;
-                    res->n_tokens = token_count;
+                    res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
@@ -3095,18 +3105,37 @@ private:
                     std::string filename = task.slot_action.filename;
                     std::string filepath = task.slot_action.filepath;
 
-                    llama_tokens tokens;
-                    tokens.resize(slot->n_ctx);
-                    size_t token_count = 0;
-                    size_t nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, tokens.data(), tokens.size(), &token_count);
-                    if (nread == 0) {
-                        slot->prompt.clear(); // KV may already been invalidated?
-                        send_error(task, "Unable to restore slot, no available space in KV cache or invalid slot save file", ERROR_TYPE_INVALID_REQUEST);
+                    size_t nread = 0;
+                    try {
+                        size_t n_packed = 0;
+                        llama_tokens packed;
+                        nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+                        if (nread != 0) {
+                            packed.resize(std::max<size_t>(1, n_packed));
+                            nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                        }
+                        if (nread == 0) {
+                            throw std::runtime_error("No available space in KV cache or invalid slot save file");
+                        }
+                        packed.resize(n_packed);
+
+                        server_tokens restored = server_tokens::deserialize(packed, mctx != nullptr);
+
+                        if (restored.size() > (size_t) slot->n_ctx) {
+                            throw std::runtime_error("Restored prompt does not fit in the slot context");
+                        }
+
+                        if (!restored.validate(ctx_tgt)) {
+                            throw std::runtime_error("Invalid tokens in slot save file");
+                        }
+
+                        slot->prompt.clear();
+                        slot->prompt.tokens = std::move(restored);
+                    } catch (const std::exception & err) {
+                        slot->prompt_clear();
+                        send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    tokens.resize(token_count);
-                    slot->prompt.clear();
-                    slot->prompt.tokens.insert(tokens);
 
                     // reload the context checkpoints written at save time; without them the
                     // next request's rollback finds no usable cache data and forces a full
@@ -3134,7 +3163,7 @@ private:
                     res->id_slot  = id_slot;
                     res->filename = filename;
                     res->is_save  = false;
-                    res->n_tokens = token_count;
+                    res->n_tokens = slot->prompt.tokens.size();
                     res->n_bytes  = nread;
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
@@ -3145,10 +3174,6 @@ private:
                     server_slot * slot = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
-                        break;
-                    }
-                    // Gate on slot content, consistent with save/restore.
-                    if (!check_slot_no_media(*slot, task.id)) {
                         break;
                     }
                     if (slot->is_processing()) {
@@ -4660,7 +4685,8 @@ private:
 
         // speculative decoding - main model sample and accept
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
+                    slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
             }
 
@@ -4671,7 +4697,6 @@ private:
 
             // verify and try to accept the draft
             {
-                // save the sampler sampler state in case we need to restore it
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
@@ -4713,7 +4738,7 @@ private:
                         }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
-                        slot.smpl = std::move(smpl_save);
+                        common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;
                     }
@@ -5303,6 +5328,18 @@ void server_routes::init_routes() {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
+            }, {
+                    {"name",  "spec_decode_num_draft_tokens_total"},
+                    {"help",  "Total draft tokens generated"},
+                    {"value",  res_task->n_draft_tokens_total}
+            }, {
+                    {"name",  "spec_decode_num_accepted_tokens_total"},
+                    {"help",  "Total draft tokens accepted by the target model"},
+                    {"value",  res_task->n_draft_accepted_total}
+            }, {
+                    {"name",  "spec_decode_num_drafts_total"},
+                    {"help",  "Total speculative decoding verification steps"},
+                    {"value",  res_task->n_draft_verif_steps_total}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -5341,6 +5378,17 @@ void server_routes::init_routes() {
                 prometheus << "# HELP llamacpp:" << name << " " << help  << "\n"
                             << "# TYPE llamacpp:" << name << " " << type  << "\n"
                             << "llamacpp:"        << name << " " << value << "\n";
+            }
+        }
+
+        // labeled counter: one time series per draft position
+        if (!res_task->n_accepted_per_pos_total.empty()) {
+            prometheus << "# HELP llamacpp:spec_decode_num_accepted_tokens_per_pos_total"
+                          " Accepted tokens per draft position\n"
+                       << "# TYPE llamacpp:spec_decode_num_accepted_tokens_per_pos_total counter\n";
+            for (size_t i = 0; i < res_task->n_accepted_per_pos_total.size(); i++) {
+                prometheus << "llamacpp:spec_decode_num_accepted_tokens_per_pos_total{position=\""
+                           << i << "\"} " << res_task->n_accepted_per_pos_total[i] << "\n";
             }
         }
 
