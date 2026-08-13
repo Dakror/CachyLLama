@@ -1066,6 +1066,14 @@ struct vk_device_struct {
     vk_pipeline pipeline_dsv4_hc_pre_f32;
     vk_pipeline pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_lightning_indexer_f32;
+    // CachyLLama: coopmat variants of the lightning indexer for tensor-core acceleration on
+    // prefill (n_batch > 1) and decode (n_batch == 1). Both are f16 K-cache, N_HEAD=64,
+    // HEAD_SIZE=128 only - anything else falls back to pipeline_lightning_indexer_f32 above.
+    // SUBGROUP_SIZE=64 spec constant is forced at create-pipeline time so coopmat picks the
+    // right WMMA layout on RDNA3 wave64 (Strix Halo etc). Pipeline nullptr when coopmat1
+    // 16x16x16 f16-acc + subgroup_size_control aren't both available.
+    vk_pipeline pipeline_lightning_indexer_cm_f16;
+    vk_pipeline pipeline_lightning_indexer_decode_cm_f16;
     std::map<vk_solve_tri_pipeline_state, vk_pipeline> pipeline_solve_tri_f32;
     vk_pipeline pipeline_im2col_f32, pipeline_im2col_f32_f16;
     vk_pipeline pipeline_im2col_3d_f32, pipeline_im2col_3d_f32_f16;
@@ -1504,6 +1512,40 @@ struct vk_op_lightning_indexer_push_constants {
 
     uint32_t k_type_id;
 };
+
+// Coopmat prefill/decode variants (lightning_indexer_cm.comp / _decode_cm.comp) use a
+// distinct push-constant layout: HEAD_SIZE=128, N_HEAD=64, K=F16 are all hardcoded in the
+// shader so they aren't parameters. All strides are element-based: the cm shaders declare
+// buffers as typed arrays (float/float16_t) and index by element, so strides must be
+// element strides (ggml_vk_nb_elem = nb / type_size), not byte strides.
+struct vk_op_lightning_indexer_cm_push_constants {
+    uint32_t n_kv;
+    uint32_t n_batch;
+    uint32_t n_stream;
+    uint32_t nem3;
+    // dst element strides (ne[1] = n_kv, ne[3] = n_stream; ne[2] = 1 and skipped).
+    uint32_t nb1;
+    uint32_t nb3;
+    // Q element strides: ne[1] = n_head, ne[2] = n_batch, ne[3] = n_stream.
+    uint32_t nbq1;
+    uint32_t nbq2;
+    uint32_t nbq3;
+    // K element strides: float16_t data_k[] indexes by element, so use element strides.
+    uint32_t nbk2;
+    uint32_t nbk3;
+    uint32_t nbw1;
+    uint32_t nbw3;
+    uint32_t nbm1;
+    uint32_t nbm3;
+
+    uint32_t q_offset;
+    uint32_t k_offset;
+    uint32_t w_offset;
+    uint32_t m_offset;
+    uint32_t d_offset;
+};
+static_assert(sizeof(vk_op_lightning_indexer_cm_push_constants) <= 128,
+              "sizeof(vk_op_lightning_indexer_cm_push_constants) must be <= 128");
 
 struct vk_op_count_experts_push_constants {
     uint32_t ne00;
@@ -2702,6 +2744,19 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
 
     p.k_type_id = (uint32_t) src1->type;
+}
+
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_lightning_indexer_cm_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    // The cm shaders do not use the *_offset fields: buffers are bound via
+    // vk_subbuffer which already includes the tensor's byte offset, so the
+    // shader indexes from the start of the tensor data. These offsets are
+    // set for completeness but are not read by the shader's push constant
+    // block (which omits the offset fields entirely).
+    p.q_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
+    p.k_offset = get_misalign_bytes(ctx, src1);
+    p.w_offset = get_misalign_bytes(ctx, src2) / ggml_type_size(src2->type);
+    p.m_offset = get_misalign_bytes(ctx, src3) / ggml_type_size(src3->type);
+    p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
 }
 
 struct ggml_backend_vk_buffer_context {
@@ -6086,6 +6141,77 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             { 1, 1, 1 }, {}, 1, true, true, li_subgroup_size);
     }
 
+    // Coopmat prefill + decode variants of the lightning indexer. Both shaders
+    // hardcode HEAD_SIZE=128, N_HEAD=64 and assume K is F16, so the dispatch in
+    // ggml_vk_lightning_indexer() picks the scalar f32 path when those don't
+    // match. The cm shader uses GL_KHR_cooperative_matrix (subgroup-scoped
+    // 16x16x16 f16 fragments); on RDNA3 wave64 each warp does a 16x16 GEMM and
+    // accumulates over N_HEAD=64 heads. We pin the subgroup size to whatever
+    // the device reports because the shader's SUBGROUP_SIZE spec constant also
+    // drives local_size_x via local_size_x_id=0 - both have to match the
+    // hardware subgroup or coopmat's WMMA layout is wrong. Coopmat1 16x16x16
+    // f16-acc + subgroup_size_control + (32 or 64) subgroup are all required;
+    // on devices that have coopmat2 but no usable 16x16x16 cm1 (very rare) we
+    // fall back to the scalar path.
+    // CachyLLama: the cm shaders (lightning_indexer_cm.comp prefill and
+    // _decode_cm.comp decode) hardcode TILE=16 and assume the workgroup's
+    // first TILE lanes do the per-kv accumulation/dst-store while lanes
+    // >=TILE sit idle. The shader's K/Q load loops use
+    // `for (idx = tid; idx < TILE*VEC_PER_HEAD; idx += SUBGROUP_SIZE)` to
+    // cooperatively fill shared memory across the wave, which works with
+    // any SUBGROUP_SIZE (32 or 64) as long as one full wave covers the
+    // 16 KV x 32 d4 = 512 vec4 layout. wg_denoms {16,16,1}/{16,1,1} feeds
+    // the dispatch grid math; the actual workgroup size is what the shader
+    // compiles to (local_size_x_id=0 -> device->subgroup_size). Lanes 16..63
+    // being idle in the dst-store phase means we run with 4x thread
+    // over-subscription on RDNA3 (wave64), but that's correct - lanes
+    // 16..63 of the wave simply skip the active-kv branch.
+    if (device->coopmat_support && device->coopmat_support_16x16x16_f16acc &&
+        device->subgroup_size_control &&
+        (device->subgroup_size == 32 || device->subgroup_size == 64)) {
+        // Use device's full subgroup size (32 or 64) so the i=0..3 outer loop
+        // in the prefill shader's accumulation phase covers 4*SUBGROUP_SIZE
+        // (key, token_local) entries per workgroup, which is 256 for the
+        // 16x16 tile. A 16-thread subgroup would only cover 64 (insufficient);
+        // a 32-thread subgroup covers 128 (still insufficient); only 64-thread
+        // (or larger) covers the full tile. The decode_cm shader has a known
+        // race with workgroup=64 (lanes 16..63 over-write dst across workgroups)
+        // and is currently disabled in cm_decode_ok.
+        // Prefill uses the device's native subgroup size (32 or 64). The
+        // i=0..3 outer loop in the prefill shader's accumulation phase covers
+        // 4*SUBGROUP_SIZE (key, token_local) entries per workgroup = 256 for
+        // the 16x16 tile. A 32-thread subgroup covers 128 (insufficient for
+        // the full tile); only 64-thread (or larger) covers it.
+        const uint32_t li_cm_prefill_sg = device->subgroup_size;
+        // Decode forces subgroup_size=32 via required_subgroup_size, which
+        // sets BOTH local_size_x (via local_size_x_id=0) and the SUBGROUP_SIZE
+        // spec constant to 32. With 32 threads, the `if (tid < TILE=16)` gate
+        // in the dst-store leaves exactly 16 idle lanes (no race). The K/Q
+        // load loops still cover the full 16x32 vec4 layout because they
+        // step by SUBGROUP_SIZE=32 (16 iterations x 32 lanes = 512 entries).
+        // On a 32-thread-only device (e.g. Phoenix) this is a no-op.
+        const uint32_t li_cm_decode_sg =
+            (device->subgroup_size == 64) ? 32u : device->subgroup_size;
+        // Prefill: wg_denoms {16,16,1} means grid = (n_kv/16, n_batch/16,
+        // n_stream). The shader covers one (kv_in_tile, batch_in_tile)
+        // block per workgroup via the i=0..3 outer loop in the prefill
+        // shader's accumulation/dst-store (4 iterations x SUBGROUP_SIZE
+        // lanes = 4*64 = 256 (key,token_local) pairs = 16x16 tile).
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_cm_f16,
+            "lightning_indexer_cm_f16", lightning_indexer_cm_f16_len, lightning_indexer_cm_f16_data,
+            "main", 5, sizeof(vk_op_lightning_indexer_cm_push_constants),
+            { 16, 16, 1 }, { li_cm_prefill_sg }, 1, true, true, li_cm_prefill_sg);
+        // Decode: wg_denoms {16,1,1}, grid = (n_kv/16, n_batch, n_stream).
+        // required_subgroup_size=li_cm_decode_sg (32 on wave64, native on
+        // wave32) prevents the dst-store race: only lanes 0..TILE-1 are
+        // active, the rest are idle. require_full_subgroups=true ensures
+        // the subgroup is fully populated.
+        ggml_vk_create_pipeline(device, device->pipeline_lightning_indexer_decode_cm_f16,
+            "lightning_indexer_decode_cm_f16", lightning_indexer_decode_cm_f16_len, lightning_indexer_decode_cm_f16_data,
+            "main", 5, sizeof(vk_op_lightning_indexer_cm_push_constants),
+            { 16, 1, 1 }, { li_cm_decode_sg }, 1, true, true, li_cm_decode_sg);
+    }
+
     // Grouped-GEMM redesign, Stage 1: row-list prepass. Builds a token -> {expert_slot, token_row}
     // list that the per-row mmid pipeline drains. On by default; use_row_lists=0 in the push
     // constants restores the old 2D row_id path (controlled by the gate in op_matmul_id).
@@ -6759,14 +6885,16 @@ static vk_device ggml_vk_get_device(size_t idx) {
         // APU/iGPU workaround: large compute batches can exceed the kernel's 2s
         // amdgpu.lockup_timeout and fragment the SA suballocator, surfacing as
         // "radv/amdgpu: Not enough memory for command submission" followed by
-        // vk::Queue::submit: ErrorDeviceLost. UMA devices (RDNA3 Phoenix, etc.)
-        // default to 8 nodes per submit so each batch finishes well under 2s.
-        // CachyLLama RDNA3 (Phoenix1/Phoenix, gfx1103, e.g. 7840U) measurement on
-        // Qwen3.6-35B-A3B Q4_K_XL showed nps=100 completes without lockup and gives
-        // a reproducible +4.5% on tg64 over nps=8; nps=64 gets ~93% of that with
-        // less lockup risk and is what llama-run.sh exports on gfx1103. See
-        // RDNA3_NOTES.md. Users can override via GGML_VK_NODES_PER_SUBMIT.
-        device->max_nodes_per_submit = device->uma ? 8 : 100;
+        // vk::Queue::submit: ErrorDeviceLost. The conservative default on UMA
+        // was 8 nodes per submit; raising it gives a reproducible +4.5% on tg64
+        // (CachyLLama RDNA3, Phoenix1/Phoenix, gfx1103, e.g. 7840U, Qwen3.6-35B
+        // Q4_K_XL: nps=100 vs nps=8). Discrete GPUs handle more work per submit
+        // safely; 100 was the prior default there. A universal 64 hits the
+        // safe middle ground: ~93% of the nps=100 win on 7840U, well under the
+        // amdgpu timeout on any UMA device, and removes the UMA/discrete
+        // special case so the same default works on Strix Halo (gfx1151) too.
+        // See RDNA3_NOTES.md. Users can override via GGML_VK_NODES_PER_SUBMIT.
+        device->max_nodes_per_submit = 64;
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
         const char* GGML_VK_NODES_PER_SUBMIT    = getenv("GGML_VK_NODES_PER_SUBMIT");
         const char * env_val = GGML_VK_NODES_PER_SUBMIT ? GGML_VK_NODES_PER_SUBMIT : GGML_VK_MAX_NODES_PER_SUBMIT;
@@ -10484,6 +10612,90 @@ static void ggml_vk_dsv4_hc_post(ggml_backend_vk_context * ctx, vk_context& subc
 static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * w, const ggml_tensor * mask, ggml_tensor * dst) {
     VK_LOG_DEBUG("ggml_vk_lightning_indexer(" << q << ", " << k << ", " << w << ", " << mask << ", " << dst << ")");
 
+    // Path selection. The coopmat variants (lightning_indexer_cm_f16 for
+    // prefill, lightning_indexer_decode_cm_f16 for decode) are strictly faster
+    // when their pre-conditions hold - they do a 16x16 GEMM per head tile on
+    // RDNA3's WMMA units and accumulate over N_HEAD=64 in registers, vs the
+    // scalar shader's K-in-shmem 32-lane dot product. Constraints come from
+    // what the cm shaders hardcode (HEAD_SIZE=128, N_HEAD=64, K must be F16)
+    // plus the 16x16 tile alignment the workgroup geometry assumes. Anything
+    // that doesn't match falls back to the scalar f32 path.
+    const uint32_t n_embd   = (uint32_t) q->ne[0];
+    const uint32_t n_head   = (uint32_t) q->ne[1];
+    const uint32_t n_batch  = (uint32_t) q->ne[2];
+    const uint32_t n_stream = (uint32_t) q->ne[3];
+    const uint32_t nem3     = (uint32_t) mask->ne[3];
+    const uint32_t n_kv     = (uint32_t) k->ne[2];
+
+    const bool cm_prefill_ok =
+        n_embd == 128 &&
+        n_head == 64 &&
+        k->type == GGML_TYPE_F16 &&
+        (n_kv % 16u) == 0u &&
+        (n_batch >= 16u && (n_batch % 16u) == 0u) &&
+        ctx->device->pipeline_lightning_indexer_cm_f16 != nullptr;
+
+    const bool cm_decode_ok =
+        n_embd == 128 &&
+        n_head == 64 &&
+        k->type == GGML_TYPE_F16 &&
+        (n_kv % 16u) == 0u &&
+        n_batch == 1u &&
+        // Decode path is enabled: the decode_cm pipeline is created with
+        // required_subgroup_size=32 (forced on wave64, native on wave32),
+        // so the shader runs with 32 threads. The `if (tid < TILE=16)` gate
+        // leaves exactly 16 idle lanes (no dst-store race) and
+        // require_full_subgroups=true ensures the subgroup is fully populated.
+        ctx->device->pipeline_lightning_indexer_decode_cm_f16 != nullptr;
+
+    if (cm_prefill_ok || cm_decode_ok) {
+        const bool decode_only = !cm_prefill_ok;
+        vk_pipeline pipeline = decode_only
+            ? ctx->device->pipeline_lightning_indexer_decode_cm_f16
+            : ctx->device->pipeline_lightning_indexer_cm_f16;
+        GGML_ASSERT(pipeline != nullptr);
+
+        ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+        const vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q,    true);
+        const vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k,    true);
+        const vk_subbuffer w_buf = ggml_vk_tensor_subbuffer(ctx, w,    true);
+        const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mask, true);
+        const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,  true);
+
+        // dst element strides: ne[1] = n_kv, ne[3] = n_stream; ne[2] is degenerate.
+        // Q element strides: ne[1] = n_head, ne[2] = n_batch, ne[3] = n_stream.
+        // K element strides: cm shaders declare data_k[] as float16_t (element-indexed),
+        // so strides must be element-based (ggml_vk_nb_elem = nb/type_size) to match.
+        // W element strides: ne[1] = n_batch, ne[3] = n_stream.
+        // M element strides: ne[1] = n_batch, ne[3] = nem3.
+        vk_op_lightning_indexer_cm_push_constants pc = {
+            n_kv, n_batch, n_stream, nem3,
+            ggml_vk_nb_elem(dst, 1),
+            ggml_vk_nb_elem(dst, 3),
+            ggml_vk_nb_elem(q, 1),
+            ggml_vk_nb_elem(q, 2),
+            ggml_vk_nb_elem(q, 3),
+            ggml_vk_nb_elem(k, 2),  // element stride: float16_t[] indexes by element
+            ggml_vk_nb_elem(k, 3),
+            ggml_vk_nb_elem(w, 1),
+            ggml_vk_nb_elem(w, 3),
+            ggml_vk_nb_elem(mask, 1),
+            ggml_vk_nb_elem(mask, 3),
+            0, 0, 0, 0, 0,
+        };
+        init_pushconst_tensor_offsets(ctx, pc, q, k, w, mask, dst);
+
+        // TILE=16 is the cm shader's hardcoded coopmat M=N=K fragment side.
+        // The cm shaders use a workgroup of (TILE, TILE) for prefill or
+        // (TILE, 1) for decode - one thread per (kv_in_tile, batch_in_tile).
+        // ggml_vk_dispatch_pipeline() divides elements[] by the pipeline's
+        // wg_denoms, so passing raw (n_kv, n_batch, n_stream) is correct.
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { q_buf, k_buf, w_buf, m_buf, d_buf }, pc,
+            { n_kv, n_batch, n_stream });
+        return;
+    }
+
     vk_pipeline pipeline = ctx->device->pipeline_lightning_indexer_f32;
     GGML_ASSERT(pipeline != nullptr);
 
@@ -10495,12 +10707,8 @@ static void ggml_vk_lightning_indexer(ggml_backend_vk_context * ctx, vk_context&
     const vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mask, true);
     const vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst,  true);
 
-    const uint32_t n_embd      = (uint32_t) q->ne[0];
-    const uint32_t n_head      = (uint32_t) q->ne[1];
-    const uint32_t n_batch     = (uint32_t) q->ne[2];
-    const uint32_t n_stream    = (uint32_t) q->ne[3];
-    const uint32_t n_kv        = (uint32_t) k->ne[2];
-    const uint32_t nem3        = (uint32_t) mask->ne[3];
+    // n_embd, n_head, n_batch, n_stream, n_kv, nem3 were all set at the top of
+    // this function for the cm-path gates; reuse them here for the scalar path.
 
     vk_op_lightning_indexer_push_constants pc = {
         n_embd, n_head, n_batch, n_stream, n_kv, nem3,
@@ -19308,7 +19516,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // initial port we restrict to the head counts the CUDA vec
                 // kernel supports: 32, 64. Anything else falls back to CPU.
                 if (op->src[0]->ne[1] != 32 && op->src[0]->ne[1] != 64) return false;
-                return device->pipeline_lightning_indexer_f32 != nullptr;
+                // The dispatch in ggml_vk_lightning_indexer() picks cm/decode_cm/f32
+                // based on which pre-conditions hold; supports_op only needs to
+                // confirm at least one of the three pipelines exists.
+                return device->pipeline_lightning_indexer_f32 != nullptr ||
+                       device->pipeline_lightning_indexer_cm_f16 != nullptr ||
+                       device->pipeline_lightning_indexer_decode_cm_f16 != nullptr;
             }
         case GGML_OP_SOLVE_TRI:
             {
