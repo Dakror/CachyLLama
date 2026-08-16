@@ -2731,8 +2731,13 @@ private:
         // The generation positions (done_pos_min/done_pos_max) extend past
         // the prompt end and cause stale positions to persist after restore,
         // triggering "Invalid input batch" on the next turn (issue #8).
-        const int64_t prompt_n_tokens = slot.prompt.n_tokens();
-        if (prompt_n_tokens < 64) return;
+       // CRITICAL: Use slot.task->n_tokens() (original prompt length) NOT
+       // slot.prompt.n_tokens() which includes generated tokens added during
+       // generation. Using the latter would store checkpoints that include
+       // generated tokens, causing cold-start restores to load generation
+       // state as if it were prompt state, leading to hallucination.
+       const int64_t prompt_n_tokens = slot.task->n_tokens();
+       if (prompt_n_tokens < 64) return;
 
         // Deferred checkpoint always captures final state. Skip the proximity
         // guard used for mid-prompt checkpoints — the deferred ckpt is never
@@ -2748,12 +2753,67 @@ private:
             }
             slot.prompt.checkpoints.erase(worst);
         }
-        auto & cur = slot.prompt.checkpoints.emplace_back();
+       auto & cur = slot.prompt.checkpoints.emplace_back();
 
         // Save prompt boundaries: pos_min=0 (start of prompt), pos_max=prompt_n_tokens-1 (end of prompt)
         cur.update_pos(prompt_n_tokens, 0, (llama_pos)prompt_n_tokens - 1);
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+        // The checkpoint metadata says n_tokens=prompt_n_tokens (prompt only),
+       // but update_tgt/update_dft save the FULL KV cache including generated
+       // token entries.  A metadata/data mismatch causes hallucination on
+       // restore: the model loads generated-token KV cache and attends to its
+       // own previous output.  Fix: temporarily strip generated-token entries
+       // from the live KV cache, save the prompt-only state, then restore the
+       // full KV cache so continued generation is unaffected.
+        {
+            // --- ctx_tgt (main model KV cache) ---
+            size_t full_size = llama_state_seq_get_size_ext(
+                ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            std::vector<uint8_t> full_state;
+            if (full_size > 0) {
+                full_state.resize(full_size);
+                llama_state_seq_get_data_ext(ctx_tgt, full_state.data(),
+                    full_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+
+            auto * mem_tgt = llama_get_memory(ctx_tgt);
+            if (mem_tgt) {
+                llama_memory_seq_rm_attn_only(
+                    mem_tgt, slot.id, (llama_pos)prompt_n_tokens, -1);
+            }
+
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+            if (!full_state.empty()) {
+                llama_state_seq_set_data_ext(ctx_tgt, full_state.data(),
+                    full_state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        }
+
+        // --- ctx_dft (draft/MTP model KV cache) ---
+        if (ctx_dft) {
+            size_t full_size = llama_state_seq_get_size_ext(
+                ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            std::vector<uint8_t> full_state;
+            if (full_size > 0) {
+                full_state.resize(full_size);
+                llama_state_seq_get_data_ext(ctx_dft.get(), full_state.data(),
+                    full_size, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+
+            auto * mem_dft = llama_get_memory(ctx_dft.get());
+            if (mem_dft) {
+                llama_memory_seq_rm_attn_only(
+                    mem_dft, slot.id, (llama_pos)prompt_n_tokens, -1);
+            }
+
+            cur.update_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+            if (!full_state.empty()) {
+                llama_state_seq_set_data_ext(ctx_dft.get(), full_state.data(),
+                    full_state.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            }
+        }
 
         SLT_INF(slot,
                 "created final context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3689,6 +3749,26 @@ private:
                                         slot.conv_hash, 0, (uint64_t)task_tokens.size(),
                                         &ssd_lcp, &ssd_overlap, &ssd_is_continuation,
                                         slot.task->user_id)) {
+                                    // Safety check: reject checkpoints that cover more tokens than
+                                    // the current task. This can happen if a deferred final
+                                    // checkpoint was created after the first generation token
+                                    // was added to the prompt (bug fixed in deferred_create_final_checkpoint
+                                    // to use slot.task->n_tokens()), or if a checkpoint from a
+                                    // longer conversation is incorrectly matched. Such checkpoints
+                                    // would restore generation state as prompt state, causing
+                                    // hallucination on cold start.
+                                    if (ssd_n_tokens > task_tokens.size()) {
+                                        SLT_WRN(slot, "cold-start: rejecting SSD checkpoint (n_tokens=%lu > task_tokens=%zu) - checkpoint appears to contain generated tokens\n",
+                                                (unsigned long)ssd_n_tokens, task_tokens.size());
+                                        llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                        if (ctx_dft) {
+                                            llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), slot.id, -1, -1);
+                                        }
+                                        n_past = 0;
+                                        slot.prompt.tokens.clear();
+                                        ssd_n_tokens = 0;
+                                    }
+
                                     // Hybrid model LCP validation. Recurrent state is
                                     // content-dependent - if the LCP is much smaller than
                                     // the checkpoint's n_tokens, the recurrent state beyond
@@ -3703,7 +3783,7 @@ private:
                                     //
                                     // For dense models the recurrent layer is replaced by full
                                     // attention, so this gate is a no-op for them.
-                                    if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS
+                                    if (ssd_n_tokens > 0 && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS
                                             && ssd_lcp > 0 && ssd_n_tokens > 0) {
                                         const uint64_t validated_tokens = std::min(
                                             ssd_n_tokens, (uint64_t)KV_SSD_TOKEN_PREFIX_MAX);
