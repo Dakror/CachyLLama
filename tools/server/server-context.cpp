@@ -910,6 +910,21 @@ private:
 
     common_params params_base;
 
+    // Compute checkpoint memory budget: `max(2 GiB, n_ctx_checkpoints * 400 MiB)`.
+// This guarantees the configured checkpoint count always fits with 2x headroom
+// for growth, so the solver's auto-scaled count (8 base + 1 per 8K above 65K,
+// capped at 32) actually fires.  Previously this was 1% of cache_ram, which
+// capped checkpoints to 3-4 at typical cache_ram sizes and made the ring
+// buffer (P1) and auto-scaling (P2) dead code.
+    size_t _ckpt_memory_budget() const {
+        const size_t default_limit = (size_t)2 * 1024 * 1024 * 1024;  // 2 GiB floor
+        if (params_base.n_ctx_checkpoints <= 0) return default_limit;
+        // 400 MiB per configured checkpoint = 200 MiB working set * 2 headroom.
+        // Covers worst-case q8_0 KV at 262K context (~100-150 MiB per ckpt).
+        const size_t per = (size_t)params_base.n_ctx_checkpoints * 400 * 1024 * 1024;
+        return std::max(default_limit, per);
+    }
+
     // note: keep these alive - they determine the lifetime of the model, context, etc.
     common_init_result_ptr llama_init;
 
@@ -2677,15 +2692,35 @@ private:
             ++it;
         }
 
+        // Same insertion-order ring buffer as deferred_create_final_checkpoint():
+        // drop the OLDEST entry by list position (front, since insert is at
+        // back).  See the matching comment there for why "evict highest
+        // pos_min" doesn't work once deferred finals survive across turns.
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            auto worst = slot.prompt.checkpoints.begin();
-            for (auto it = std::next(worst); it != slot.prompt.checkpoints.end(); ++it) {
-                if (it->pos_min > worst->pos_min) worst = it;
-            }
+            const auto & victim = slot.prompt.checkpoints.front();
+            SLT_WRN(slot, "erasing old context checkpoint by ring buffer (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    victim.pos_min, victim.pos_max, victim.n_tokens, (float) victim.size() / 1024 / 1024);
+            slot.prompt.checkpoints.pop_front();
+        }
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    worst->pos_min, worst->pos_max, worst->n_tokens, (float) worst->size() / 1024 / 1024);
-            slot.prompt.checkpoints.erase(worst);
+        // Size-based memory budget (P3): evict largest checkpoints if total
+        // memory exceeds _ckpt_memory_budget().  This runs after count-based
+        // eviction so that a high checkpoint count can be sustained as long
+        // as total memory stays within limits.
+        {
+            const size_t ckpt_mem_limit = _ckpt_memory_budget();
+            size_t total_ckpt_mem = 0;
+            for (const auto & c : slot.prompt.checkpoints) total_ckpt_mem += c.size();
+            while (total_ckpt_mem > ckpt_mem_limit && slot.prompt.checkpoints.size() > 1) {
+                auto largest = slot.prompt.checkpoints.begin();
+                for (auto it = std::next(largest); it != slot.prompt.checkpoints.end(); ++it) {
+                    if (it->size() > largest->size()) largest = it;
+                }
+                total_ckpt_mem -= largest->size();
+                SLT_TRC(slot, "evicting checkpoint by memory budget (size = %.3f MiB, total = %.3f MiB, limit = %zu MiB)\n",
+                        (float)largest->size() / 1024 / 1024, (float)total_ckpt_mem / 1024 / 1024, ckpt_mem_limit / 1024 / 1024);
+                slot.prompt.checkpoints.erase(largest);
+            }
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -2703,8 +2738,9 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                "[ring buffer] appended mid-prompt checkpoint at back (buffer=%zu/%d): "
+                "pos_min=%d pos_max=%d n_tokens=%" PRId64 " size=%.3f MiB\n",
+                slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
         // SSD-backed KV cache: store checkpoint on disk
@@ -2739,21 +2775,84 @@ private:
        const int64_t prompt_n_tokens = slot.task->n_tokens();
        if (prompt_n_tokens < 64) return;
 
+        // Note: cold-start mid-prompts (create_checkpoint() emits one with
+        // pos_min==0 on a fresh slot, since pos_min_thold==0 with no prior
+        // context) intentionally share the (pos_min=0, pos_max=prompt_end)
+        // signature of a deferred final.  They're valid LCP snapshots at
+        // [0, batch_end] and consumed by the LCP acceptance predicate on
+        // future turns.  The SWA-skip guard in get_available() preserves
+        // them alongside real deferred finals, costing one of the N ring
+        // buffer slots per cold start.  That's correct -- not a bug.
+        //
+
         // Deferred checkpoint always captures final state. Skip the proximity
         // guard used for mid-prompt checkpoints — the deferred ckpt is never
         // "too close" to a prior ckpt; it's the most complete snapshot.
 
-        // Same eviction policy as create_checkpoint: prefer to keep
-        // low-pos_min checkpoints (useful for future early-LCP turns)
-        // and evict the highest-pos_min checkpoint when at capacity.
-        while (slot.prompt.checkpoints.size() >= (size_t)params_base.n_ctx_checkpoints) {
-            auto worst = slot.prompt.checkpoints.begin();
-            for (auto it = std::next(worst); it != slot.prompt.checkpoints.end(); ++it) {
-                if (it->pos_min > worst->pos_min) worst = it;
+        // Ring buffer: when at capacity, overwrite the least-useful checkpoint
+        // in place instead of erasing+emplacing.  This preserves vector
+        // capacity (no reallocation churn), gives clean cycling checkpoint
+        // numbers (1..N, 1..N, ...), and avoids erase() invalidating iterators.
+        // The eviction policy (highest pos_min) is the same as create_checkpoint()
+        // -- for deferred finals (all pos_min=0) this picks the oldest/least-
+        // complete entry, which is correct.
+        //
+        // Size-based memory budget (P3): evict largest first if total exceeds
+        // _ckpt_memory_budget(), before count-based eviction.
+        {
+            const size_t ckpt_mem_limit = _ckpt_memory_budget();
+            size_t total_ckpt_mem = 0;
+            for (const auto & c : slot.prompt.checkpoints) total_ckpt_mem += c.size();
+            while (ckpt_mem_limit > 0 && total_ckpt_mem > ckpt_mem_limit && slot.prompt.checkpoints.size() > 1) {
+                auto largest = slot.prompt.checkpoints.begin();
+                for (auto it = std::next(largest); it != slot.prompt.checkpoints.end(); ++it) {
+                    if (it->size() > largest->size()) largest = it;
+                }
+                total_ckpt_mem -= largest->size();
+                SLT_TRC(slot, "evicting checkpoint by memory budget (size = %.3f MiB, total = %.3f MiB, limit = %zu MiB)\n",
+                        (float)largest->size() / 1024 / 1024, (float)total_ckpt_mem / 1024 / 1024, ckpt_mem_limit / 1024 / 1024);
+                slot.prompt.checkpoints.erase(largest);
             }
-            slot.prompt.checkpoints.erase(worst);
         }
-       auto & cur = slot.prompt.checkpoints.emplace_back();
+
+        common_prompt_checkpoint * cur_ptr = nullptr;
+        bool recycled = false;
+        if (slot.prompt.checkpoints.size() >= (size_t)params_base.n_ctx_checkpoints) {
+            // Ring buffer recycle: move the FRONT (oldest by insertion order)
+            // to the BACK and clear it in place.  Splice preserves the std::list
+            // node (no allocation); clear() preserves the data vector capacity
+            // (no reallocation).  After this, the recycled entry is at the
+            // back and ready to be refilled below with today's snapshot.
+            //
+            // Why insertion order: deferred finals all carry pos_min == 0
+            // (the SWA-skip guard below preserves them across turns), so the
+            // old "evict highest pos_min" comparison always tied to 0 and
+            // picked begin() forever -- a single-slot FIFO with 15 dead
+            // entries.  Insertion order breaks the tie.
+            //
+            // Why splice+clear instead of pop_front+emplace_back: keeps the
+            // recycled entry's existing vector capacity instead of throwing
+            // it away.  For a server that's been running for hours, this
+            // avoids ~32 KB worth of reallocations on every checkpoint.
+            const auto & victim = slot.prompt.checkpoints.front();
+            SLT_INF(slot,
+                    "[ring buffer] recycling front->back (in place): "
+                    "dropped pos_min=%d pos_max=%d n_tokens=%" PRId64 " size=%.3f MiB\n",
+                    victim.pos_min, victim.pos_max, victim.n_tokens,
+                    (float)victim.size() / 1024 / 1024);
+            slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(),
+                                          slot.prompt.checkpoints,
+                                          slot.prompt.checkpoints.begin());
+            // The spliced node is now at the back.  clear() preserves capacity.
+            slot.prompt.checkpoints.back().clear();
+            recycled = true;
+        }
+        if (!recycled) {
+            cur_ptr = &slot.prompt.checkpoints.emplace_back();
+        } else {
+            cur_ptr = &slot.prompt.checkpoints.back();
+        }
+        auto & cur = *cur_ptr;
 
         // Save prompt boundaries: pos_min=0 (start of prompt), pos_max=prompt_n_tokens-1 (end of prompt)
         cur.update_pos(prompt_n_tokens, 0, (llama_pos)prompt_n_tokens - 1);
@@ -2815,9 +2914,17 @@ private:
             }
         }
 
+        // Log the resulting entry.  After ring buffer saturation this always
+        // shows "%d/%d" (==n_ctx_checkpoints) because we never let the buffer
+        // grow past N -- but the SLT_INF "[ring buffer] recycling" line
+        // emitted above is the canonical "what just happened" message; the
+        // pos_min / pos_max / n_tokens / size fields here are what was just
+        // written into the (possibly recycled) entry.
         SLT_INF(slot,
-                "created final context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                (int)slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
+                "[ring buffer] %s slot at back (buffer=%zu/%d): "
+                "pos_min=%d pos_max=%d n_tokens=%" PRId64 " size=%.3f MiB\n",
+                recycled ? "recycled and rewrote" : "appended new",
+                slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
                 cur.pos_min, cur.pos_max, cur.n_tokens,
                 (float)cur.size() / 1024 / 1024);
 
@@ -4236,10 +4343,25 @@ private:
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // Erase checkpoints whose pos_max is past pos_next.
+                                //
+                                // Exception: deferred-final snapshots (pos_min == 0)
+                                // are baked from a known-good state at end-of-prompt.
+                                // SWA invalidation should not erase them on every turn
+                                // because they were valid at capture time, and the load
+                                // predicate below already filters out checkpoints that
+                                // no longer cover pos_next (n_swa > 0 && cur.pos_max >
+                                // pos_next in the acceptance loop).
+                                //
+                                // Without this guard, the SWA step would erase every
+                                // older deferred final, defeating the ring buffer
+                                // (P1) and the auto-scaled checkpoint count (P2).
+                                // Both checkpoints shrink to a stale pair and the
+                                // ring buffer never accumulates past 2 entries.
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
+                                    const bool deferred_final_snapshot = (cur.pos_min == 0);
+                                    if (!deferred_final_snapshot && cur.pos_max > pos_next) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
