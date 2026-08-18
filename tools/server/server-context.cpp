@@ -2807,21 +2807,23 @@ private:
         // The generation positions (done_pos_min/done_pos_max) extend past
         // the prompt end and cause stale positions to persist after restore,
         // triggering "Invalid input batch" on the next turn (issue #8).
-        // CRITICAL: Use slot.prompt.n_tokens() - slot.n_decoded (actual
+        // CRITICAL: Use slot.prompt.n_tokens() - slot.n_decoded + 1 (actual
         // prompt tokens processed) NOT slot.task->n_tokens() (which is the
         // full task token count, including unprocessed conversation history)
         // and NOT slot.prompt.n_tokens() alone (which includes generated
         // tokens added since the deferred flag was set). At this point the
-        // first generation token has been sampled/pushed and n_decoded
-        // incremented, so subtracting n_decoded recovers the prompt
-        // boundary. This matters when CLIO trims the conversation: the
-        // task object may carry the full untrimmed token count while the
-        // actual prompt fed to the model is a small slice. Using
-        // slot.task->n_tokens() produced a metadata/KV-cache mismatch
-        // (e.g. checkpoint n_tokens=115419 while only 12084 tokens were
-        // processed), which made the next turn's LCP match collapse to
-        // sim_best=0.24 and forced a near-scratch reprocess every turn.
-        const int64_t prompt_n_tokens = slot.prompt.n_tokens() - slot.n_decoded;
+        // first generation token has been sampled (n_decoded incremented)
+        // but NOT yet pushed to prompt.tokens (handle_last_sampled_token
+        // runs after the sampling loop, not inside it). So:
+        //   prompt.tokens has N + (k-1) tokens for the k-th generation
+        //   n_decoded = k
+        //   prompt_n_tokens = (N + k - 1) - k + 1 = N  (the prompt boundary)
+        // Subtracting only n_decoded (without the +1) gave N - 1, which
+        // made pos_max cover positions [0, N-2] instead of [0, N-1] -- the
+        // last prompt token's KV cache entry was stripped from the checkpoint.
+        // On restore the model had to reprocess that 1 token every cold
+        // start, and f_keep/f_sim metrics were off by 1 token.
+        const int64_t prompt_n_tokens = slot.prompt.n_tokens() - slot.n_decoded + 1;
         if (prompt_n_tokens < 64) return;
 
         // Note: cold-start mid-prompts (create_checkpoint() emits one with
