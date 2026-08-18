@@ -1810,7 +1810,22 @@ private:
                 }
 
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
-                const float sim_cur = float(tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+                const int common_prefix = tokens.get_common_prefix(task.tokens);
+
+                // Stable-prefix gate: if the caller told us how many leading
+                // tokens form a stable prefix (system prompt + thread_summary),
+                // reject any slot whose stored prompt does not share that
+                // prefix. This lets CLIO keep summary positions byte-identical
+                // across turns so the LCP match survives a context trim.
+                // Legacy behavior (prompt_stable_prefix_tokens == 0): no gate.
+                if (task.params.prompt_stable_prefix_tokens > 0 &&
+                    common_prefix < task.params.prompt_stable_prefix_tokens) {
+                    SLT_DBG(slot, "LCP match rejected: common_prefix=%d < stable_prefix=%d\n",
+                            common_prefix, task.params.prompt_stable_prefix_tokens);
+                    continue;
+                }
+
+                const float sim_cur = float(common_prefix) / task.tokens.size();
 
                 // select the current slot if the criteria match
                 if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
@@ -1824,8 +1839,13 @@ private:
                 const float f_keep = (sim_best*task.tokens.size()) / ret->prompt.tokens.size();
 
                 if (task.id_slot == -1) {
-                    SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
-                            sim_best, slot_prompt_similarity, f_keep);
+                    if (task.params.prompt_stable_prefix_tokens > 0) {
+                        SLT_INF(*ret, "selected slot by LCP similarity (stable prefix=%d), sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                                task.params.prompt_stable_prefix_tokens, sim_best, slot_prompt_similarity, f_keep);
+                    } else {
+                        SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
+                                sim_best, slot_prompt_similarity, f_keep);
+                    }
                 }
 
                 // if we are about to lose a large portion of the existing context - save it in the prompt cache
@@ -1898,7 +1918,27 @@ private:
                 ret->prompt_save(*prompt_cache);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
+                    // Defensive guard: do NOT clear slot.prompt.tokens here.
+                    //
+                    // The LCP match in get_available_slot() already validated
+                    // this slot (passed the sim_best > slot_prompt_similarity
+                    // gate above). prompt_cache.load() can return false for
+                    // benign reasons: the just-saved entry's f_keep/f_sim are
+                    // equal to the baseline (not strictly greater), the cache
+                    // has no other entries to compare against, or the cache
+                    // is disabled. Clearing slot.prompt.tokens here would wipe
+                    // the very state the in-memory checkpoint LCP matcher
+                    // needs at server-context.cpp ~line 4096
+                    // (`n_past = slot.prompt.tokens.get_common_prefix(input_tokens)`)
+                    // and force a from-scratch prefill of the full prompt on
+                    // every turn. The ring buffer checkpoints (dbedc9ec) and
+                    // the deferred_create_final_checkpoint metadata fix
+                    // (3cbc0516e) already provide a correct restore path; we
+                    // must not destroy the in-memory prompt they depend on.
+                    //
+                    // Log a warning so this is visible in debug output, but
+                    // leave the prompt and KV cache intact.
+                    SLT_WRN(*ret, "%s", "prompt_cache.load() returned false after save; preserving slot prompt for in-memory checkpoint LCP match\n");
                 }
 
                 prompt_cache->update();
@@ -2767,13 +2807,22 @@ private:
         // The generation positions (done_pos_min/done_pos_max) extend past
         // the prompt end and cause stale positions to persist after restore,
         // triggering "Invalid input batch" on the next turn (issue #8).
-       // CRITICAL: Use slot.task->n_tokens() (original prompt length) NOT
-       // slot.prompt.n_tokens() which includes generated tokens added during
-       // generation. Using the latter would store checkpoints that include
-       // generated tokens, causing cold-start restores to load generation
-       // state as if it were prompt state, leading to hallucination.
-       const int64_t prompt_n_tokens = slot.task->n_tokens();
-       if (prompt_n_tokens < 64) return;
+        // CRITICAL: Use slot.prompt.n_tokens() - slot.n_decoded (actual
+        // prompt tokens processed) NOT slot.task->n_tokens() (which is the
+        // full task token count, including unprocessed conversation history)
+        // and NOT slot.prompt.n_tokens() alone (which includes generated
+        // tokens added since the deferred flag was set). At this point the
+        // first generation token has been sampled/pushed and n_decoded
+        // incremented, so subtracting n_decoded recovers the prompt
+        // boundary. This matters when CLIO trims the conversation: the
+        // task object may carry the full untrimmed token count while the
+        // actual prompt fed to the model is a small slice. Using
+        // slot.task->n_tokens() produced a metadata/KV-cache mismatch
+        // (e.g. checkpoint n_tokens=115419 while only 12084 tokens were
+        // processed), which made the next turn's LCP match collapse to
+        // sim_best=0.24 and forced a near-scratch reprocess every turn.
+        const int64_t prompt_n_tokens = slot.prompt.n_tokens() - slot.n_decoded;
+        if (prompt_n_tokens < 64) return;
 
         // Note: cold-start mid-prompts (create_checkpoint() emits one with
         // pos_min==0 on a fresh slot, since pos_min_thold==0 with no prior
