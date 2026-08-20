@@ -2738,8 +2738,8 @@ private:
         // pos_min" doesn't work once deferred finals survive across turns.
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             const auto & victim = slot.prompt.checkpoints.front();
-            SLT_WRN(slot, "erasing old context checkpoint by ring buffer (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    victim.pos_min, victim.pos_max, victim.n_tokens, (float) victim.size() / 1024 / 1024);
+            SLT_WRN(slot, "kv ring buffer, evicted oldest (size=%.3f MiB)\n",
+                    (float) victim.size() / 1024 / 1024);
             slot.prompt.checkpoints.pop_front();
         }
 
@@ -2778,10 +2778,9 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "[ring buffer] appended mid-prompt checkpoint at back (buffer=%zu/%d): "
-                "pos_min=%d pos_max=%d n_tokens=%" PRId64 " size=%.3f MiB\n",
-                slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                "kv ring buffer, pushed mid-prompt to slot %zu/%d (pos_min=%d size=%.3f MiB)\n",
+                slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
+                cur.pos_min, (float) cur.size() / 1024 / 1024);
 
         // SSD-backed KV cache: store checkpoint on disk
         if (ssd_page_manager) {
@@ -2887,10 +2886,9 @@ private:
             // avoids ~32 KB worth of reallocations on every checkpoint.
             const auto & victim = slot.prompt.checkpoints.front();
             SLT_INF(slot,
-                    "[ring buffer] recycling front->back (in place): "
-                    "dropped pos_min=%d pos_max=%d n_tokens=%" PRId64 " size=%.3f MiB\n",
-                    victim.pos_min, victim.pos_max, victim.n_tokens,
-                    (float)victim.size() / 1024 / 1024);
+                    "kv ring buffer, recycled slot %zu/%d (dropped pos_min=%d size=%.3f MiB)\n",
+                    slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
+                    victim.pos_min, (float)victim.size() / 1024 / 1024);
             slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(),
                                           slot.prompt.checkpoints,
                                           slot.prompt.checkpoints.begin());
@@ -2967,17 +2965,15 @@ private:
 
         // Log the resulting entry.  After ring buffer saturation this always
         // shows "%d/%d" (==n_ctx_checkpoints) because we never let the buffer
-        // grow past N -- but the SLT_INF "[ring buffer] recycling" line
+        // grow past N -- but the SLT_INF "kv ring buffer, recycled" line
         // emitted above is the canonical "what just happened" message; the
-        // pos_min / pos_max / n_tokens / size fields here are what was just
-        // written into the (possibly recycled) entry.
+        // pos_min / size fields here are what was just written into the
+        // (possibly recycled) entry.
         SLT_INF(slot,
-                "[ring buffer] %s slot at back (buffer=%zu/%d): "
-                "pos_min=%d pos_max=%d n_tokens=%" PRId64 " size=%.3f MiB\n",
-                recycled ? "recycled and rewrote" : "appended new",
+                "kv ring buffer, %s checkpoint to slot %zu/%d (pos_min=%d size=%.3f MiB)\n",
+                recycled ? "recycled" : "pushed final",
                 slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
-                cur.pos_min, cur.pos_max, cur.n_tokens,
-                (float)cur.size() / 1024 / 1024);
+                cur.pos_min, (float)cur.size() / 1024 / 1024);
 
         if (ssd_page_manager) {
             const auto & prefix_tokens = slot.task
@@ -4262,7 +4258,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (pos_min <= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
