@@ -15,9 +15,10 @@ llama_add_compile_flags()
 if (EMSCRIPTEN)
 else()
     # CachyLLama server-focused build: only build tools needed by the server
-    # and diagnostic/benchmarking tooling. Shedded tools (cli, completion,
+    # and diagnostic/benchmarking tooling. Shedded tools (completion,
     # perplexity, parser, tts, batched-bench, gguf-split, fit-params, results,
     # cvector-generator, export-lora, rpc) are omitted for a leaner build.
+    add_subdirectory(cli)
     add_subdirectory(imatrix)
     add_subdirectory(llama-bench)
     add_subdirectory(quantize)
