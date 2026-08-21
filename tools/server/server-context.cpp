@@ -2700,20 +2700,19 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        // Evict the least-useful checkpoint when at capacity.
+        // Evict least-useful checkpoints when at capacity.
         //
-        // "Least useful" = the checkpoint with the highest pos_min. The do_reset
-        // search at prefill time uses `cur.pos_min < pos_min_thold` to find a
-        // checkpoint whose recurrent state covers the LCP-aligned position. For
-        // hybrid models with bounded recurrence (Gated DeltaNet / Mamba), pos_min
-        // is bounded by the rec window size, so checkpoints with recent pos_min
-        // never satisfy the constraint for early-LCP future turns.
+        // We use insertion-order eviction (drop the front/oldest entry, append
+        // new at back) rather than the old "evict highest pos_min" policy.
+        // Deferred finals all carry pos_min == 0, so a pos_min comparator would
+        // always tie and pick begin() forever -- a single-slot FIFO with N-1
+        // dead entries.  Insertion order gives true round-robin cycling (1..N,
+        // 1..N, ...) and works for both mid-prompt and deferred-final entries.
         //
-        // Evicting insertion-oldest (the previous behavior) loses mid-checkpoints
-        // from long turns first when short follow-up turns add deferred finals
-        // to the same ring. That leaves the slot with only recent deferred
-        // finals, all with high pos_min, forcing do_reset to fire on every
-        // future turn whose LCP predates the latest rec window.
+        // For hybrid/recurrent models, the LCP acceptance predicate (line ~4264)
+        // still filters by pos_min / pos_max and applies its own n_swa > 0 check;
+        // reverse iteration (rbegin/rend) picks the newest qualifying entry, so
+        // insertion-order insertion doesn't affect which checkpoint is selected.
         const int id_task = slot.task->id;
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2767,9 +2766,9 @@ private:
 
         cur.id_task = id_task;
 
-        // [TAG_CHECKPOINTS_FIX_POS_MIN]
-        // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
-        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+        // Note: for SWA models, pos_min/pos_max may not cover the full [0, pos_max]
+        // range (see LCP acceptance predicate at line ~4264 which applies an
+        // n_swa > 0 guard excluding checkpoints where cur.pos_max > pos_next).
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -2778,7 +2777,7 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         SLT_TRC(slot,
-                "kv ring buffer, pushed mid-prompt to slot %zu/%d (pos_min=%d size=%.3f MiB)\n",
+                "kv ring buffer, pushed mid-prompt (%zu/%d full, pos_min=%d size=%.3f MiB)\n",
                 slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
                 cur.pos_min, (float) cur.size() / 1024 / 1024);
 
@@ -2843,9 +2842,10 @@ private:
         // in place instead of erasing+emplacing.  This preserves vector
         // capacity (no reallocation churn), gives clean cycling checkpoint
         // numbers (1..N, 1..N, ...), and avoids erase() invalidating iterators.
-        // The eviction policy (highest pos_min) is the same as create_checkpoint()
-        // -- for deferred finals (all pos_min=0) this picks the oldest/least-
-        // complete entry, which is correct.
+        // Uses the same insertion-order policy as create_checkpoint(): drop the
+        // front (oldest by insertion order) and splice it to the back.
+        // See create_checkpoint's comment for why "evict highest pos_min"
+        // doesn't work once deferred finals survive across turns.
         //
         // Size-based memory budget (P3): evict largest first if total exceeds
         // _ckpt_memory_budget(), before count-based eviction.
@@ -2886,7 +2886,7 @@ private:
             // avoids ~32 KB worth of reallocations on every checkpoint.
             const auto & victim = slot.prompt.checkpoints.front();
             SLT_INF(slot,
-                    "kv ring buffer, recycled slot %zu/%d (dropped pos_min=%d size=%.3f MiB)\n",
+                    "kv ring buffer, recycled (%zu/%d full, dropped pos_min=%d size=%.3f MiB)\n",
                     slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
                     victim.pos_min, (float)victim.size() / 1024 / 1024);
             slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(),
@@ -2963,15 +2963,12 @@ private:
             }
         }
 
-        // Log the resulting entry.  After ring buffer saturation this always
-        // shows "%d/%d" (==n_ctx_checkpoints) because we never let the buffer
-        // grow past N -- but the SLT_INF "kv ring buffer, recycled" line
-        // emitted above is the canonical "what just happened" message; the
-        // pos_min / size fields here are what was just written into the
-        // (possibly recycled) entry.
+        // Log the resulting entry.  The canonical "what just happened" message
+        // is the "recycled" or "pushed" final line above; this line confirms
+        // what was written into the (possibly recycled) back entry.
         SLT_INF(slot,
-                "kv ring buffer, %s checkpoint to slot %zu/%d (pos_min=%d size=%.3f MiB)\n",
-                recycled ? "recycled" : "pushed final",
+                "kv ring buffer, %s final checkpoint (%zu/%d full, pos_min=%d size=%.3f MiB)\n",
+                recycled ? "recycled" : "pushed",
                 slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
                 cur.pos_min, (float)cur.size() / 1024 / 1024);
 
