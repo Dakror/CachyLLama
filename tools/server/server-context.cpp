@@ -212,6 +212,7 @@ struct server_slot {
     bool deferred_final_checkpoint = false;  // create final checkpoint after first token
     bool ssd_cold_start_used       = false;  // SSD cache restored for this slot on cold start
     uint64_t conv_hash             = 0;      // consistent conversation hash for all checkpoints
+    bool   needs_session_reset     = false;  // set by get_available_slot, checked by launch_slot_with_task
     std::string user_id_;                        // identity of the owning task (for scheduling/affinity)
 
     stop_type stop;
@@ -307,7 +308,12 @@ struct server_slot {
         truncated      = false;
         deferred_final_checkpoint = false;
         ssd_cold_start_used       = false;
-        conv_hash                 = 0;
+        // NOTE: conv_hash is intentionally NOT reset here. It is preserved
+        // across tasks so that launch_slot_with_task can detect conversation
+        // boundaries (new agent sessions) by comparing the previous conv_hash
+        // with the incoming task's conv_hash. It IS updated to the new task's
+        // hash in launch_slot_with_task, and cleared only when the slot is
+        // truly freed (e.g., via prompt_clear on child slots).
         user_id_.clear();
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
@@ -1762,6 +1768,22 @@ private:
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        bool session_reset = false;  // set when slot belongs to a different conversation
+
+        // Compute the incoming task's conversation hash from the first 1024
+        // tokens. This is compared against each slot's stored conv_hash to
+        // detect conversation boundaries (new agent sessions). When a mismatch
+        // is detected, the slot's KV cache + prompt are purged so the new
+        // session starts fresh instead of being corrupted by stale context.
+        uint64_t task_conv_hash = 0;
+        {
+            const auto & task_tokens = task.tokens.get_tokens();
+            if (!task_tokens.empty()) {
+                size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
+                task_conv_hash = kv_ssd_hash_tokens(
+                    (const uint32_t *)task_tokens.data(), hash_len);
+            }
+        }
 
         // Per-user concurrency cap. If the requesting user_id (or the
         // _anonymous bucket for empty user_id) is already at the cap,
@@ -1809,6 +1831,18 @@ private:
                     continue;
                 }
 
+                // Skip slots belonging to a different conversation. When the
+                // slot's conv_hash (from a previous task) doesn't match the
+                // incoming task's conv_hash, this is a new session — reusing
+                // the old KV cache would corrupt the new conversation with
+                // stale context. The slot will be recovered via LRU fallback
+                // and cleared in the cache-update block below.
+                if (slot.conv_hash != 0 && slot.conv_hash != task_conv_hash) {
+                    SLT_DBG(slot, "LCP match rejected: conv_hash mismatch (slot=0x%016lx task=0x%016lx) - different conversation\n",
+                            (unsigned long)slot.conv_hash, (unsigned long)task_conv_hash);
+                    continue;
+                }
+
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const int common_prefix = tokens.get_common_prefix(task.tokens);
 
@@ -1837,6 +1871,17 @@ private:
 
             if (ret != nullptr) {
                 const float f_keep = (sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+
+                // Detect conversation boundary via LCP quality: when the
+                // stored prompt is NOT a prefix of the incoming task (f_keep < 0.5)
+                // AND the match is poor (sim_best < 0.95), the slot belongs
+                // to a different conversation even if the first 1024 tokens
+                // (conv_hash) happen to match. This catches new sessions with
+                // the same system prompt but different conversation bodies.
+                // The sim_best < 0.95 guard avoids false positives on
+                // legitimate trims where the task IS a prefix of the stored
+                // prompt (sim = 1.0) — only the length differs.
+                session_reset = session_reset || (f_keep < 0.5f && sim_best < 0.95f);
 
                 if (task.id_slot == -1) {
                     if (task.params.prompt_stable_prefix_tokens > 0) {
@@ -1920,6 +1965,22 @@ private:
                 const int64_t t_start = ggml_time_us();
 
                 ret->prompt_save(*prompt_cache);
+
+                // Session boundary detection: combine conv_hash mismatch and
+                // low f_keep to detect conversation changes. When detected,
+                // clear the KV cache + prompt so prompt_load() searches for
+                // a match from the NEW session instead of restoring stale
+                // context from the previous conversation.
+                if (!session_reset && ret->conv_hash != 0 && ret->conv_hash != task_conv_hash) {
+                    session_reset = true;
+                }
+
+                if (session_reset) {
+                    SLT_INF(*ret, "conversation boundary: clearing stale KV cache from previous session (conv_hash slot=0x%016lx task=0x%016lx)\n",
+                            (unsigned long)ret->conv_hash, (unsigned long)task_conv_hash);
+                    ret->prompt_clear();
+                    ret->needs_session_reset = true; // signal launch_slot_with_task (no-op if already cleared)
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     // Defensive guard: do NOT clear slot.prompt.tokens here.
@@ -2120,12 +2181,37 @@ private:
         // Compute conversation hash once from the full task tokens.
         // All checkpoints (mid-prompt and deferred) must use the same
         // hash to prevent splitting checkpoints across conversations.
+        // Also used to detect conversation boundaries: if the incoming task's
+        // conv_hash differs from the slot's existing conv_hash, the previous
+        // agent session ended (or a new one started), and the slot's KV cache
+        // + prompt must be purged to avoid corrupting the new conversation with
+        // stale context from the previous one.
+        uint64_t task_conv_hash = 0;
         {
             const auto & task_tokens = slot.task->tokens.get_tokens();
             size_t hash_len = std::min(task_tokens.size(), (size_t)1024);
-            slot.conv_hash = kv_ssd_hash_tokens(
+            task_conv_hash = kv_ssd_hash_tokens(
                 (const uint32_t *)task_tokens.data(), hash_len);
         }
+
+        // Detect conversation boundary: if the slot already has a conv_hash
+        // (from a previous task) and it differs from the incoming task's hash,
+        // this is a new session — purge the old KV cache and prompt tokens
+        // to prevent stale context from corrupting the new conversation.
+        if (slot.needs_session_reset || (slot.conv_hash != 0 && slot.conv_hash != task_conv_hash)) {
+            if (!slot.needs_session_reset) {
+                SLT_INF(slot, "conversation boundary detected (conv_hash: slot=0x%016lx task=0x%016lx) - purging KV cache and prompt for new session\n",
+                        (unsigned long)slot.conv_hash, (unsigned long)task_conv_hash);
+            }
+
+            // seq_rm with p0=-1, p1=-1 removes ALL KV cache entries for this
+            // slot's sequence id, across both target and draft contexts
+            // (common_memory::seq_rm handles ctx_dft internally).
+            slot.prompt_clear();
+        }
+
+        slot.conv_hash = task_conv_hash;
+        slot.needs_session_reset = false;
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
