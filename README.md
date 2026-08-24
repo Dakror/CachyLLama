@@ -464,9 +464,9 @@ conventions.
 
 **CachyLLama source code:** MIT (same as upstream `llama.cpp`, see
 [LICENSE](LICENSE), Copyright (c) 2023-2026 The ggml authors). All CachyLLama
-additions — the persistent KV cache, MoE expert residency, Lightning Indexer,
+additions - the persistent KV cache, MoE expert residency, Lightning Indexer,
 Vulkan shader work, DFlash/Laguna model support, user isolation, and the
-`common::host_available_ram()` utility — are released under the same MIT terms.
+`common::host_available_ram()` utility - are released under the same MIT terms.
 
 **llama-ai parent project:** GPL-3.0-or-later for source, CC-BY-NC-SA-4.0 for
 documentation (see the [parent project LICENSE](https://github.com/fewtarius/llama-ai/blob/main/LICENSE)).

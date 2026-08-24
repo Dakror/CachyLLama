@@ -81,8 +81,6 @@ cmake --build build --config Release -j$(nproc)
 # Run CLI chat
 ./build/bin/llama-cli -m /path/to/model.gguf
 
-# Run tests
-cd build && ctest --output-on-failure
 ```
 
 > **Note:** For end-to-end usage (runner scripts, GPU detection, benchmark

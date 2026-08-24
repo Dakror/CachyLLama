@@ -18,8 +18,6 @@ void main() {
         return;
     }
 
-    const uint b_idx = 1024*i + 32*ir + 16*il;
-
 #ifdef DEQUANT_TRANSPOSE
     // Fused dequant+transpose for FA quant-KV: source physical is [HS, NH, KV, NS]
     // (p.M=HS, p.K=NH, p.stride_a=KV); write to per-head-contiguous dest [HS, KV, NH, NS] so the
@@ -27,11 +25,13 @@ void main() {
     // 32 contiguous dest positions.
     const uint HS = p.M, NH = p.K, KVn = p.stride_a;
     const uint e0 = ib * 32;
-    const uint b_idx_t = (e0 % HS)
-                       + ((e0 / (HS * NH)) % KVn) * HS
-                       + ((e0 / HS) % NH) * (HS * KVn)
-                       + (e0 / (HS * NH * KVn)) * (HS * KVn * NH)
-                       + 16 * il;
+    const uint b_idx = (e0 % HS)
+                     + ((e0 / (HS * NH)) % KVn) * HS
+                     + ((e0 / HS) % NH) * (HS * KVn)
+                     + (e0 / (HS * NH * KVn)) * (HS * KVn * NH)
+                     + 16 * il;
+#else
+    const uint b_idx = 1024*i + 32*ir + 16*il;
 #endif
 
     const float d = float(data_a[ib].d);
@@ -39,12 +39,7 @@ void main() {
     const uint q_idx = 16*il;
 
     [[unroll]] for (uint l = 0; l < 16; l += 2) {
-#ifdef DEQUANT_TRANSPOSE
-        data_b[b_idx_t + l    ] = D_TYPE(d * data_a[ib].qs[q_idx + l    ]);
-        data_b[b_idx_t + l + 1] = D_TYPE(d * data_a[ib].qs[q_idx + l + 1]);
-#else
         data_b[b_idx + l    ] = D_TYPE(d * data_a[ib].qs[q_idx + l    ]);
         data_b[b_idx + l + 1] = D_TYPE(d * data_a[ib].qs[q_idx + l + 1]);
-#endif
     }
 }
