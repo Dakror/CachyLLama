@@ -285,6 +285,16 @@ struct server_slot {
 
         mem.seq_rm(id, -1, -1);
 
+        // Conversation identity fields must NOT survive a true slot
+        // reset (cold start). They are intentionally preserved across
+        // task boundaries so get_available_slot() and launch_slot_with_task()
+        // can recognise a returning same-session task; when the prompt is
+        // cleared (cold start, child-slot release, error path, boundary
+        // purge) the slot is no longer associated with the previous
+        // conversation and these fields must be reset.
+        conv_hash = 0;
+        user_id_.clear();
+
         prompt.clear();
     }
 
@@ -332,7 +342,15 @@ struct server_slot {
         // with the incoming task's conv_hash. It IS updated to the new task's
         // hash in launch_slot_with_task, and cleared only when the slot is
         // truly freed (e.g., via prompt_clear on child slots).
-        user_id_.clear();
+        //
+        // user_id_ is preserved for the same reason: the LCP same-session
+        // gate in get_available_slot() (line ~1794) compares the incoming
+        // task's user_id against slot.user_id_ to decide whether to trust
+        // session continuity across turns. Clearing it on reset() made that
+        // check always evaluate to false for slot.user_id_.empty(), forcing
+        // a false-positive conversation boundary on every turn after the
+        // first even for the same agent session. Cleared only when the slot
+        // is truly freed (e.g., via prompt_clear on child slots).
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
@@ -1767,7 +1785,49 @@ private:
                 // The sim_best < 0.95 guard avoids false positives on
                 // legitimate trims where the task IS a prefix of the stored
                 // prompt (sim = 1.0) — only the length differs.
-                session_reset = session_reset || (f_keep < 0.5f && sim_best < 0.95f);
+                // When llama_user_id is present and matches the slot owner,
+                // and conv_hash matches (same first 1024 tokens), session
+                // continuity is already established via user_id + conv_hash.
+                // CLIO's prompt architecture has a large stable prefix
+                // (prompt_stable_prefix_tokens, ~29K tokens: system prompt +
+                // CSSS summary + context files) plus a large variable suffix
+                // (~58K tokens: dialog + tool_results). The LCP match correctly
+                // identifies the stable prefix, but f_keep drops below 0.5
+                // because the variable suffix dominates the prompt size.
+                // Applying the LCP heuristic here fires a false-positive
+                // boundary, clearing the KV cache and triggering a double-clear
+                // (prompt_clear in get_available_slot + prompt_clear again in
+                // launch_slot_with_task via needs_session_reset flag). This
+                // wipes the partial KV cache restore from prompt_load(),
+                // forcing the entire ~89K-token prompt to be reprocessed every
+                // turn instead of just the ~60K new tokens.
+                //
+                // Only apply LCP-based boundary detection for anonymous
+                // requests (no user_id) or when user_id doesn't match
+                // (different session, same system prompt). When user_id +
+                // conv_hash match, trust the session continuity and preserve
+                // the KV cache.
+                if (!session_reset) {
+                    const bool same_session =
+                        (!task.user_id.empty() &&
+                         !ret->user_id_.empty() &&
+                         ret->user_id_ == task.user_id &&
+                         ret->conv_hash != 0 &&
+                         ret->conv_hash == task_conv_hash);
+                    if (!same_session) {
+                        session_reset = session_reset || (f_keep < 0.5f && sim_best < 0.95f);
+                    } else {
+                        SLT_DBG(*ret, "session continuity preserved (user_id match + conv_hash=0x%016lx match), "
+                                "skipping LCP boundary detection (f_keep=%.3f, sim_best=%.3f, stable_prefix=%d)\n",
+                                (unsigned long)task_conv_hash, f_keep, sim_best,
+                                task.params.prompt_stable_prefix_tokens);
+                    }
+                    SLT_INF(*ret, "user_id check: task='%s' slot='%s', conv_hash match=%d, same_session=%d (f_keep=%.3f, sim_best=%.3f)\n",
+                            task.user_id.c_str(), ret->user_id_.c_str(),
+                            (int)(ret->conv_hash == task_conv_hash),
+                            (!task.user_id.empty() && !ret->user_id_.empty() && ret->user_id_ == task.user_id && ret->conv_hash != 0 && ret->conv_hash == task_conv_hash),
+                            f_keep, sim_best);
+                }
 
                 if (task.id_slot == -1) {
                     if (task.params.prompt_stable_prefix_tokens > 0) {
@@ -2096,7 +2156,13 @@ private:
             // seq_rm with p0=-1, p1=-1 removes ALL KV cache entries for this
             // slot's sequence id, across both target and draft contexts
             // (common_memory::seq_rm handles ctx_dft internally).
+            // Also clear user_id_ so it does not leak across the
+            // conversation boundary into the new session's LCP-match
+            // affinity check. The incoming task's user_id will be
+            // assigned to slot.user_id_ above before any subsequent
+            // session continuity decision runs.
             slot.prompt_clear();
+            slot.user_id_.clear();
         }
 
         slot.conv_hash = task_conv_hash;
