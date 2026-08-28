@@ -19,6 +19,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "hash/hash.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -1773,8 +1774,13 @@ private:
             auto it = user_counts_.find(bucket);
             const int cur = (it == user_counts_.end()) ? 0 : it->second;
             if (cur >= params_base.max_concurrent_per_user) {
-                SRV_INF("per-user concurrency cap hit for user_id='%s' (cur=%d, cap=%d)\n",
-                        bucket.c_str(), cur, params_base.max_concurrent_per_user);
+                // Avoid logging the raw user_id; emit only the first
+                // 8 hex chars of the SHA-256 digest for correlation.
+                const std::string hash_tag = bucket == "_anonymous"
+                    ? std::string("anon")
+                    : hash_sha256_hex(bucket.data(), bucket.size()).substr(0, 8);
+                SRV_INF("per-user concurrency cap hit for %s (cur=%d, cap=%d)\n",
+                        hash_tag.c_str(), cur, params_base.max_concurrent_per_user);
                 return nullptr;
             }
         }
@@ -1895,8 +1901,16 @@ private:
                                 (unsigned long)task_conv_hash, f_keep, sim_best,
                                 task.params.prompt_stable_prefix_tokens);
                     }
-                    SLT_INF(*ret, "user_id check: task='%s' slot='%s', conv_hash match=%d, same_session=%d (f_keep=%.3f, sim_best=%.3f)\n",
-                            task.user_id.c_str(), ret->user_id_.c_str(),
+                    // Redact raw user_ids in the INFO log; emit short
+                    // SHA-256 prefixes for correlation only.
+                    const std::string task_tag = task.user_id.empty()
+                        ? std::string("<empty>")
+                        : hash_sha256_hex(task.user_id.data(), task.user_id.size()).substr(0, 8);
+                    const std::string slot_tag = ret->user_id_.empty()
+                        ? std::string("<empty>")
+                        : hash_sha256_hex(ret->user_id_.data(), ret->user_id_.size()).substr(0, 8);
+                    SLT_INF(*ret, "user_id check: task=%s slot=%s, conv_hash match=%d, same_session=%d (f_keep=%.3f, sim_best=%.3f)\n",
+                            task_tag.c_str(), slot_tag.c_str(),
                             (int)(ret->conv_hash == task_conv_hash),
                             (!task.user_id.empty() && !ret->user_id_.empty() && ret->user_id_ == task.user_id && ret->conv_hash != 0 && ret->conv_hash == task_conv_hash),
                             f_keep, sim_best);
