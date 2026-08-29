@@ -10985,6 +10985,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
 
     vk_pipeline pipeline = ggml_vk_guess_matmul_id_pipeline(ctx, mmp, ne01, nei1, aligned, qx_needs_dequant ? f16_type : src0->type, effective_src1_type);
 
+    // CachyLLama: keep padded_N for the carry's fused-scale + use_row_lists push constants.
+    // (Upstream 77f132cb1 removed this in favor of K-padding for the bare mmid path, but
+    // our mul_mat_mat_id pipeline is more advanced and still uses padded_N for the Y staging.)
+    const uint32_t padded_n = qy_needs_dequant ? ROUNDUP_POW2(ne11, pipeline->wg_denoms[1]) : ne11;
+
     // PROBE (GGML_VK_MMID_PROBE=1): which mmid tile actually runs, and with how many threads.
     static const char * mmid_probe_env = getenv("GGML_VK_MMID_PROBE");
     if (mmid_probe_env && atoi(mmid_probe_env) != 0) {
