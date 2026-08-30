@@ -667,7 +667,7 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         for (int il = 0; il < n_layer; ++il) {
             const auto & layer = model.layers[il];
 
-            // Laguna draft layers project context K/V from the input_layernorm
+// Laguna draft layers project context K/V from the input_layernorm
             // output, matching the query path (generic DFlash projects raw).
             ggml_tensor * kv_inp = inp_g;
             if (model_df.decoder_laguna) {
@@ -675,8 +675,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 cb(kv_inp, "kv_inp_normed", il);
             }
 
-            ggml_tensor * Kcur = build_lora_mm(layer.wk, kv_inp);
-            ggml_tensor * Vcur = build_lora_mm(layer.wv, kv_inp);
+            // NVFP4 scales (upstream #28000): pass to build_lora_mm for per-row dequant.
+            ggml_tensor * Kcur = build_lora_mm(layer.wk, kv_inp, layer.wk_s);
+            ggml_tensor * Vcur = build_lora_mm(layer.wv, kv_inp, layer.wv_s);
 
             Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
             Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
@@ -758,9 +759,9 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
             cb(noise_norm, "attn_conv_in", il);
         }
 
-        ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm);
-        ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm);
-        ggml_tensor * Vcur = build_lora_mm(layer.wv, noise_norm);
+        ggml_tensor * Qcur = build_lora_mm(layer.wq, noise_norm, layer.wq_s);
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, noise_norm, layer.wk_s);
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, noise_norm, layer.wv_s);
 
         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
@@ -781,8 +782,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         ggml_tensor * wo    = gated ? NULL : layer.wo;
 
         ggml_tensor * cur = use_iswa
-            ? build_attn(inp_attn_iswa, wo,      NULL, NULL, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
-            : build_attn(inp_attn,      wo,      NULL, NULL, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
+            ? build_attn(inp_attn_iswa, wo,      NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il)
+            : build_attn(inp_attn,      wo,      NULL, layer.wo_s, Qcur, Kcur, Vcur, nullptr, layer.attn_sinks, nullptr, kq_scale, il);
 
         if (gated) {
             // Softplus output gate on the pre-attention hidden state, per-head
