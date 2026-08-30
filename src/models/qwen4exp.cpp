@@ -762,7 +762,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     // the decode gather path needs the selection padded to the flash attention KV granularity;
     // build_attn_qsa_gather masks the extra entries out again, so the visible set stays `width`
-    const int64_t n_sel = std::max<int64_t>(width, qsa_gather_n_sel(n_kv, width));
+    // Cache the raw gather decision for build_attn_qsa to reuse instead
+    // of recomputing the env-gated qsa_gather_n_sel gate.
+    qsa_last_n_sel_ = qsa_gather_n_sel(n_kv, width);
+    const int64_t n_sel = std::max<int64_t>(width, qsa_last_n_sel_);
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, n_sel));
 
@@ -825,7 +828,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
         // build_qsa_top_k took the same decision, so top_k already has n_sel entries
-        const int64_t n_sel = qsa_gather_n_sel(n_kv, width);
+        // Reuse the cached decision from build_qsa_top_k instead of
+        // recomputing the env-gated qsa_gather_n_sel gate.
+        const int64_t n_sel = qsa_last_n_sel_;
         if (n_sel > 0) {
             GGML_ASSERT(top_k->ne[0] == n_sel);
 

@@ -1504,14 +1504,6 @@ private:
             cfg.page_size_tokens = params_base.cache_ssd_page_size_tokens;
             cfg.max_cold_checkpoints = params_base.cache_ssd_max_cold;
             cfg.turn_inactivity_threshold = 2;
-            // On UMA APUs the loaded model is GTT-mapped in system RAM.
-            // Pass its size to the auto-size path so the SSD hot/warm
-            // budgets don't compete with the GTT-mapped weights. See
-            // common/kv-ssd-cache.cpp auto-size handling. Ignored when
-            // auto_size is false (the user supplied explicit caps).
-            if (model_tgt != nullptr) {
-                cfg.model_size_bytes = (size_t) llama_model_size(model_tgt);
-            }
 
             ssd_page_manager = std::make_unique<llama::server_context_page_manager>(
                 params_base.cache_ssd_path.c_str(), &cfg,
