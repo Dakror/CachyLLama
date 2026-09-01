@@ -666,6 +666,20 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
         res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
+        // CachyLLama: apply aux_norm (per-aux RMS-norm + scale) before fc, matching
+        // graph<true>'s encoder path. Without this, Laguna drafters (which set
+        // aux_norm) produce mis-normalized encoded embeddings, which corrupt the K/V
+        // cache injection and drop draft acceptance to ~30%.
+        if (model_df.aux_norm != nullptr) {
+            const int64_t n_aux  = model_df.aux_norm->ne[1];
+            const int64_t n_feat = hparams.n_embd_inp_enc() / n_aux;
+
+            inp_target = ggml_reshape_3d(ctx0, inp_target, n_feat, n_aux, n_tokens);
+            inp_target = ggml_rms_norm(ctx0, inp_target, hparams.f_norm_rms_eps);
+            inp_target = ggml_mul(ctx0, inp_target, model_df.aux_norm);
+            inp_target = ggml_reshape_2d(ctx0, inp_target, n_feat * n_aux, n_tokens);
+            cb(inp_target, "enc_aux_norm", -1);
+        }
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
         inp_g = build_norm(inp_g, model.output_norm_enc, NULL, LLM_NORM_RMS, -1);
         cb(inp_g, "inp_g_embeddings", -1);
@@ -935,7 +949,26 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
         res->add_input(std::move(inp));
 
         // fuse the target features through the encoder
-        ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
+        ggml_tensor * inp_g;
+        {
+            // CachyLLama: apply aux_norm (per-aux RMS-norm + scale) before fc, matching
+            // graph<true>'s encoder path. Without this, Laguna drafters (which set
+            // aux_norm) produce mis-normalized encoded embeddings, which corrupt the K/V
+            // cache injection and drop draft acceptance to ~30%.
+            const auto & model_df = static_cast<const llama_model_dflash &>(model);
+            ggml_tensor * cur = inp_target;
+            if (model_df.aux_norm != nullptr) {
+                const int64_t n_aux  = model_df.aux_norm->ne[1];
+                const int64_t n_feat = hparams.n_embd_inp_enc() / n_aux;
+
+                cur = ggml_reshape_3d(ctx0, cur, n_feat, n_aux, n_tokens);
+                cur = ggml_rms_norm(ctx0, cur, hparams.f_norm_rms_eps);
+                cur = ggml_mul(ctx0, cur, model_df.aux_norm);
+                cur = ggml_reshape_2d(ctx0, cur, n_feat * n_aux, n_tokens);
+                cb(cur, "enc_aux_norm", -1);
+            }
+            inp_g = build_lora_mm(model.fc, cur, model.fc_s);
+        }
         inp_g = build_norm(inp_g, model.output_norm_enc, nullptr, LLM_NORM_RMS, -1);
         cb(inp_g, "inp_g_embeddings", -1);
 
