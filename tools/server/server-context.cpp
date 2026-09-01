@@ -2257,7 +2257,17 @@ private:
         // (from a previous task) and it differs from the incoming task's hash,
         // this is a new session — purge the old KV cache and prompt tokens
         // to prevent stale context from corrupting the new conversation.
-        if (slot.needs_session_reset || (slot.conv_hash != 0 && slot.conv_hash != task_conv_hash)) {
+        // Skip the conv_hash branch for stateless embedding tasks: each
+        // request is an independent document with no shared prefix, and
+        // pre_decode() will perform an unconditional seq_rm(id, 0, -1) +
+        // prompt.tokens.keep_first(0) on the non-LCP path (can_split() is
+        // false for non-LAST pooling because need_embd()=true), so the
+        // boundary purge here is strictly redundant work (~50ms per reused
+        // slot on small embedding models). needs_session_reset still fires
+        // so error/recovery paths are unaffected.
+        const bool stateless = (slot.task->type == SERVER_TASK_TYPE_EMBEDDING);
+        const bool conv_boundary = !stateless && slot.conv_hash != 0 && slot.conv_hash != task_conv_hash;
+        if (slot.needs_session_reset || conv_boundary) {
             if (!slot.needs_session_reset) {
                 SLT_INF(slot, "conversation boundary detected (conv_hash: slot=0x%016lx task=0x%016lx) - purging KV cache and prompt for new session\n",
                         (unsigned long)slot.conv_hash, (unsigned long)task_conv_hash);
