@@ -810,7 +810,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() ||
+                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1209,9 +1210,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             common_sampler_reset(smpls[seq_id].get());
 
-            const int32_t n = (int32_t) dp.n_past;
+           const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            // respect the context-aware per-call draft limit (dp.n_max, set by
+            // the server's get_n_draft_max() to fit the remaining KV cache space),
+            // capped at the trained block-size limit (params.n_max). Without this,
+            // the draft always emits params.n_max tokens (+1 seed) even when the
+            // cache is nearly full, causing "failed to find a memory slot for
+            // batch of size N" on the draft decode.
+            const int32_t n_draft = std::min(params.n_max, std::max(0, dp.n_max));
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1730,7 +1737,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (params.n_max <= (int) result.size() ||
+                    (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
