@@ -406,6 +406,7 @@ struct server_slot {
             spec_draft.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
+            spec_prompt.clear();
         }
         generated_tokens.clear();
         generated_token_probs.clear();
@@ -508,10 +509,30 @@ struct server_slot {
             return 0;
         }
 
-        // determine the max draft that fits the current slot state
-        // note: slot.prompt is not yet expanded with the `id` token sampled above
-        //       also, need to leave space for 1 extra token to allow context shifts
-        int n_draft_max = n_ctx - prompt.n_tokens() - 2;
+        // Determine the max draft that fits the current slot state.
+        // Use llama_memory_seq_pos_max() (the live KV cache cursor) rather
+        // than prompt.n_tokens() (which counts all tokens in slot.prompt,
+        // including ones beyond the LCP boundary that have not yet been
+        // promoted to live KV state via keep_first()).
+        //
+        // Without this, after a checkpoint restore the draft budget was
+        // computed against the un-trimmed LCP token count, which over-
+        // counts by up to checkpoint_min_step tokens. With the n_max cap
+        // applied at the drafter (commit ce0a66429), the drafter would
+        // silently produce a smaller draft than it could, costing one or
+        // two decode steps per turn on long-context workloads. Correctness
+        // was unaffected -- it's a perf miss -- but on 131K conversations
+        // with checkpoint_min_step=32768 the loss compounds.
+        //
+        // Fall back to prompt.tokens.size() if no live KV state exists yet
+        // (cold start, before the first decode), since the seq_pos_max call
+        // would return -1.
+        llama_pos pos_now = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), id);
+        const int n_tokens_live = (pos_now < 0) ? prompt.n_tokens() : (int)(pos_now + 1);
+
+        // leave 2 cells of headroom: 1 for the next sampled token, 1 for
+        // a context-shift discard to land in.
+        int n_draft_max = n_ctx - n_tokens_live - 2;
 
         if (n_remaining() > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining() - 1);
@@ -578,6 +599,24 @@ struct server_slot {
             }
 
             callback_on_reset(*this);
+
+            // Drop any in-flight speculative state that survived from the
+            // just-stopped generation. reset() also clears spec_draft /
+            // spec_i_batch / spec_ckpt but only when can_speculate() is
+            // true, and any future path that calls release() without going
+            // through reset() (or that holds spec_* before reset() runs)
+            // would otherwise let a stale partial draft bleed into the next
+            // task's first decode. spec_i_batch in particular is never
+            // cleared by reset() because the assert at server-context.cpp:3932
+            // fires if it isn't empty when the speculative path re-enters --
+            // we'd rather clear it than GGML_ABORT the server on a
+            // misbehaving path.
+            if (can_speculate()) {
+                spec_draft.clear();
+                spec_i_batch.clear();
+                spec_prompt.clear();
+                spec_ckpt.clear();
+            }
 
             reset();
 
@@ -2983,6 +3022,19 @@ private:
     // batch was processed and the first generation token has been sent.
     // Runs asynchronously relative to the client, so the ~670 MiB SSD write
     // does not block the first token.
+    //
+    // Wrapper used by the two post-decode call sites (non-speculative and
+    // speculative sample-and-accept). It clears the deferred flag exactly
+    // once, regardless of which control flow path is taken through
+    // process_token() (continue vs. stop). The previous open-coded blocks
+    // duplicated this pair in four places, which made it easy to forget
+    // one when a new release / stop path is added.
+    void flush_deferred_final_checkpoint(server_slot & slot) {
+        if (!slot.deferred_final_checkpoint) return;
+        slot.deferred_final_checkpoint = false;
+        deferred_create_final_checkpoint(slot);
+    }
+
     void deferred_create_final_checkpoint(server_slot & slot) {
         if (params_base.n_ctx_checkpoints <= 0) return;
         if (!slot.task || slot.task->type != SERVER_TASK_TYPE_COMPLETION) return;
@@ -5177,26 +5229,19 @@ private:
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
 
+            // Flush any deferred final checkpoint before either path (stop /
+            // continue) so the capture happens once and on the right boundary.
+            // Without this, a stop on the first generated token would skip the
+            // checkpoint entirely.
+            flush_deferred_final_checkpoint(slot);
+
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
-                if (slot.deferred_final_checkpoint) {
-                    slot.deferred_final_checkpoint = false;
-                    deferred_create_final_checkpoint(slot);
-                }
                 slot.print_timings();
                 send_final_response(slot);
                 slot.release();
 
                 return;
-            }
-
-            // Defer final checkpoint after first token is sent.
-            // The inline mid-prompt checkpoints in create_checkpoint()
-            // were created before the last batch; this captures the
-            // full prompt state so warm restarts skip nearly all tokens.
-            if (slot.deferred_final_checkpoint) {
-                slot.deferred_final_checkpoint = false;
-                deferred_create_final_checkpoint(slot);
             }
 
             slot.print_timings_tg();
@@ -5319,23 +5364,20 @@ size_t n_accepted = ids.size() - 1;
 
                 slot.stats.n_gen += 1;
 
+                // Flush any deferred final checkpoint on the first accepted
+                // token (i == 0). For longer acceptance runs the flag is
+                // already cleared; the helper is a no-op.
+                if (i == 0) {
+                    flush_deferred_final_checkpoint(slot);
+                }
+
                 if (!process_token(result, slot)) {
-                    if (slot.deferred_final_checkpoint) {
-                        slot.deferred_final_checkpoint = false;
-                        deferred_create_final_checkpoint(slot);
-                    }
                     slot.print_timings();
                     send_final_response(slot);
                     slot.release();
 
                     return;
                 }
-            }
-
-            // Defer final checkpoint after first token(s) sent
-            if (slot.deferred_final_checkpoint) {
-                slot.deferred_final_checkpoint = false;
-                deferred_create_final_checkpoint(slot);
             }
 
             slot.print_timings_tg();
