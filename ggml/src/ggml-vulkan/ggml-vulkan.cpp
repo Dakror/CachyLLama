@@ -11758,7 +11758,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     uint32_t workgroups_z = (uint32_t)neq3;
 
     const bool f32acc = !ctx->device->fp16 || dst->op_params[3] == GGML_PREC_F32 || k->type == GGML_TYPE_BF16;
-
+    
 // CachyLLama (upstream ggml-org/llama.cpp#25494): at prefill with quantized K/V,
     // the coopmat1 path re-dequantizes the whole KV cache inside every Q workgroup and
     // reads it strided. Dequant+transpose into a per-head-contiguous f16 scratch once,
@@ -11770,6 +11770,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     // boxes with long context the scratch can exceed MemAvailable, so we gate on host RAM
     // unless the user opted out (GGML_VK_NO_FA_SCRATCH_TRANSPOSE) or forced it
     // (GGML_VK_FA_SCRATCH_FORCE).
+    // dequant K/V once into an f16 scratch, reordered KV layout so FA can read without a stride
+    auto is_dense_kv_cache = [](const ggml_tensor * t) {
+        return t->nb[0] == ggml_type_size(t->type) &&
+               t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
+               t->nb[1] == t->nb[2] * t->ne[2] &&
+               (t->ne[3] == 1 || t->nb[3] == t->nb[1] * t->ne[1]);
+    };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
     // EXPERIMENT (GGML_VK_FA_KV_CONTIG=1): the same contiguize pass for f16 K/V. The
