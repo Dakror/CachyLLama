@@ -2759,7 +2759,7 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
 }
 
 int32_t llama_model_n_expert_used(const llama_model * model) {
-    return model->hparams.n_expert_used;
+    return model->hparams.n_expert_used();
 }
 
 int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
