@@ -960,6 +960,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         ));
     }
 
+    // if the preserve_reasoning kwarg was not specified explicitly, enable it by default
+    if (!params.default_template_kwargs.count("preserve_reasoning")) {
+        params.default_template_kwargs["preserve_reasoning"] = "true";
+    }
+
     return true;
 }
 
@@ -1643,6 +1648,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_CTX_SIZE"));
+    add_opt(common_arg(
+        { "--kv-unified-per-slot" }, "N",
+        "context limit per parallel slot (default: unset, behavior unchanged).\n"
+        "when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N",
+        [](common_params & params, int value) {
+            params.kv_unified_per_slot = value;
+        }
+    ).set_env("LLAMA_ARG_KV_UNIFIED_PER_SLOT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"-n", "--predict", "--n-predict"}, "N",
         string_format(
@@ -2908,18 +2921,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_RESIDENCY_DEBUG_INTERVAL"));
     add_opt(common_arg(
-        {"--tensor-read-lazy"}, "MODE",
+        {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"
         "- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)\n"
         "- auto: on, but only for tensors larger than 4 GiB\n"
         "- off: always keep them resident",
         [](common_params & params, const std::string & value) {
-            /**/ if (value == "on")   { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_ON;   }
-            else if (value == "auto") { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; }
-            else if (value == "off")  { params.tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_OFF;  }
+            /**/ if (value == "on")   { params.lazy_mode = LLAMA_LAZY_MODE_ON;   }
+            else if (value == "auto") { params.lazy_mode = LLAMA_LAZY_MODE_AUTO; }
+            else if (value == "off")  { params.lazy_mode = LLAMA_LAZY_MODE_OFF;  }
             else { throw std::invalid_argument("invalid value"); }
         }
-    ).set_env("LLAMA_ARG_TENSOR_READ_LAZY"));
+    ).set_env("LLAMA_ARG_LAZY_MODE"));
     add_opt(common_arg(
         {"--numa"}, "TYPE",
         "attempt optimizations that help on some NUMA systems\n"
@@ -3732,6 +3745,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     LOG_WRN("Setting 'enable_thinking' via --chat-template-kwargs is deprecated. "
                             "Use --reasoning on / --reasoning off instead.\n");
                 }
+                if (item.key() == "preserve_reasoning") {
+                    LOG_WRN("Setting 'preserve_reasoning' via --chat-template-kwargs is deprecated. "
+                            "Use --reasoning-preserve / --no-reasoning-preserve instead.\n");
+                }
                 params.default_template_kwargs[item.key()] = item.value().dump();
             }
         }
@@ -3922,7 +3939,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
-        "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"
+        "preserve reasoning trace in the full history, not just the last assistant message (default: enabled)\n"
         "compatible with certain templates having 'supports_preserve_reasoning' capability\n"
         "example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking",
         [](common_params & params, bool value) {
@@ -3931,6 +3948,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             } else {
                 params.default_template_kwargs["preserve_reasoning"] = "false";
             }
+            params.preserve_reasoning_specified = true;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_PRESERVE"));
     add_opt(common_arg(
